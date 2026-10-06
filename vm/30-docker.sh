@@ -520,23 +520,46 @@ start_docker_apps() {
 
 # Vérifie les éléments indispensables avant de lancer les stacks.
 # Cela rend notamment les problèmes Sync-in beaucoup plus explicites.
+#
+# La VM vient d'être redémarrée (qm start) pour attacher le VirtioFS :
+# l'agent QEMU et le montage /srv/data (fstab, _netdev) ne sont prêts qu'au
+# bout de quelques dizaines de secondes. On attend donc l'agent, puis on
+# retente la vérification plusieurs fois avant de conclure à un échec.
 verify_docker_shared_storage() {
 
     local VMID="$1"
+    local MAX_ATTEMPTS="${2:-24}"
+    local attempt raw exitcode
 
     info "Vérification du stockage SHARED dans la VM DOCKER..."
 
-    qm guest exec "$VMID" -- bash -c '
-        set -e
-        mountpoint -q /srv/data
-        getent group fileshare | grep -q ":2000:"
-        test -d /srv/data/Family
-        test -d /srv/data/Photo
-        test -d /srv/data/Movies
-        test -d /srv/data/Music
-    ' || die "SHARED n'est pas correctement monté dans la VM DOCKER. Les stacks Docker ne doivent pas être démarrées avant correction."
+    wait_for_qemu_agent "$VMID" 60 \
+        || die "L'agent QEMU de la VM DOCKER ne répond pas après le redémarrage. Diagnostic : qm config ${VMID} | grep -E 'agent|virtiofs' ; journalctl -b | grep -i virtiofsd | tail ; console de la VM : systemctl status qemu-guest-agent"
 
-    info "SHARED est monté et le groupe fileshare/GID ${SHARED_GID} est présent dans DOCKER."
+    for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+
+        raw="$(qm guest exec "$VMID" -- bash -c '
+            set -e
+            mountpoint -q /srv/data
+            getent group fileshare | grep -q ":2000:"
+            test -d /srv/data/Family
+            test -d /srv/data/Photo
+            test -d /srv/data/Movies
+            test -d /srv/data/Music
+        ' 2>&1 || true)"
+
+        exitcode="$(jq -r '.exitcode // empty' <<< "$raw" 2>/dev/null || true)"
+
+        if [[ "$exitcode" == "0" ]]; then
+            info "SHARED est monté et le groupe fileshare/GID ${SHARED_GID} est présent dans DOCKER."
+            return 0
+        fi
+
+        info "SHARED pas encore prêt dans DOCKER (tentative ${attempt}/${MAX_ATTEMPTS}, exitcode='${exitcode}') ; nouvelle tentative dans 5 s."
+        sleep 5
+    done
+
+    die "SHARED n'est pas correctement monté dans la VM DOCKER après $(( MAX_ATTEMPTS * 5 ))s. Dernière sortie : ${raw}. Diagnostic : qm guest exec ${VMID} -- bash -c 'findmnt /srv/data; mount | grep virtiofs; dmesg | grep -i virtiofs; ls -la /srv/data'. Les stacks Docker ne doivent pas être démarrées avant correction."
 }
 
 create_docker_vm() {
