@@ -15,6 +15,7 @@ configure_variables() {
     echo "  DOCKER = ${ENABLE_DOCKER}"
     echo "  FILES  = ${ENABLE_FILES}"
     echo "  XMRIG  = ${ENABLE_XMRIG}"
+    echo "  WG     = ${ENABLE_WIREGUARD}"
     echo "  HA     = ${ENABLE_HOMEASSISTANT}"
     echo "  JELLY  = ${ENABLE_JELLYFIN}"
     echo

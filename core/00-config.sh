@@ -28,7 +28,7 @@ export DEBIAN_FRONTEND=noninteractive
 #                              CONFIGURATION                                  #
 ###############################################################################
 
-SCRIPT_VERSION="2.26.2"
+SCRIPT_VERSION="2.27.0"
 
 # ---------------------------------------------------------------------------
 # Modules
@@ -38,6 +38,7 @@ ENABLE_SWAG=true
 ENABLE_DOCKER=true
 ENABLE_FILES=true
 ENABLE_XMRIG=true
+ENABLE_WIREGUARD=true
 
 # ---------------------------------------------------------------------------
 # Proxmox
@@ -189,6 +190,35 @@ LE_EMAIL=""
 SWAG_CORES="1"
 SWAG_MEMORY="512"
 SWAG_DISK="8G"
+
+# ---------------------------------------------------------------------------
+# WireGuard (VPN)
+# ---------------------------------------------------------------------------
+
+WG_ID="106"
+WG_HOSTNAME="wireguard"
+WG_IP="10.10.10.106/24"
+WG_GATEWAY="10.10.10.1"
+WG_CORES="1"
+WG_MEMORY="256"
+WG_DISK="2G"
+WG_UNPRIVILEGED="1"         # 0 = CT privilégié (si WireGuard refuse de démarrer en non privilégié)
+
+WG_PORT="51820"             # UDP : à rediriger sur la box vers l'IP LAN de l'hôte
+WG_NET="10.10.20.0/24"      # réseau VPN (obligatoirement un /24)
+WG_SERVER_IP="10.10.20.1"
+WG_MTU="1420"
+WG_ENDPOINT=""              # nom/IP publique donnés aux clients ; vide = ${DOMAIN}
+WG_DNS="1.1.1.1, 9.9.9.9"   # DNS donnés aux pairs du profil "internet"
+
+# Pairs créés à l'installation : "nom:profil" séparés par des espaces.
+# Profils : lan | backup | internet  (d'autres se créent ensuite : wg_add_peer)
+WG_PEERS="pc:lan"
+
+# Destinations autorisées par profil (vide = valeur par défaut calculée) :
+WG_LAN_ROUTES=""            # défaut : réseau privé des VM + IP LAN de l'hôte (/32)
+WG_BACKUP_DESTS=""          # défaut : IP de la VM FILES
+WG_BACKUP_PORTS="22,445"    # ports TCP autorisés pour le profil backup
 
 # ---------------------------------------------------------------------------
 # XMRig

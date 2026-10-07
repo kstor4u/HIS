@@ -186,7 +186,9 @@ write_files:
 
           chmod 700 webmin-setup-repo.sh
 
-          sh ./webmin-setup-repo.sh
+          # Le script de dépôt Webmin peut demander une confirmation (y/N) ;
+          # sans terminal (cloud-init) il n'aurait aucune réponse : on la fournit.
+          sh ./webmin-setup-repo.sh <<< "y"
 
           apt-get update
 

@@ -65,7 +65,7 @@ show_summary() {
             echo "    LAN       : http://${LAN_IP}:${SYNCIN_HTTP_PORT}"
             echo "    Via SWAG  : https://sync.${DOMAIN}"
             echo "    Admin     : ${SYNCIN_ADMIN_LOGIN} / ${SYNCIN_ADMIN_PASSWORD}"
-            echo "    ATTENTION : vérifie /opt/apps/syncin/environment.yaml contre la doc officielle si le conteneur ne démarre pas"
+            echo "    SHARED    : Admin > Spaces > ajouter une racine externe ${DOCKER_SHARED_MOUNT}/Family (idem Photo, Movies, Music)"
             echo
         fi
 
@@ -94,6 +94,7 @@ show_summary() {
             echo "    Local     : http://${DOCKER_IP%%/*}:${JELLYFIN_HTTP_PORT}"
             echo "    LAN       : http://${LAN_IP}:${JELLYFIN_HTTP_PORT}"
             echo "    Via SWAG  : https://media.${DOMAIN}"
+            echo "    Via SWAG  : https://media.${DOMAIN}"
             echo "    Movies    : ${DOCKER_SHARED_MOUNT}/Movies (lecture seule)"
             echo "    Music     : ${DOCKER_SHARED_MOUNT}/Music (lecture seule)"
             echo "    Photo     : ${DOCKER_SHARED_MOUNT}/Photo (lecture seule)"
@@ -109,6 +110,25 @@ show_summary() {
         echo "  Domain    : ${DOMAIN}"
         echo "  Cloud     : cloud.${DOMAIN}"
         echo "  Sync      : sync.${DOMAIN}"
+        if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
+            echo "  Media     : media.${DOMAIN}"
+        fi
+        echo
+    fi
+
+    if [[ "$ENABLE_WIREGUARD" == "true" ]]; then
+
+        echo "WireGuard (VPN):"
+        echo "  CTID      : ${WG_ID}"
+        echo "  IP        : ${WG_IP}"
+        echo "  Écoute    : UDP ${WG_PORT}  ->  À REDIRIGER SUR LA BOX vers ${LAN_IP}"
+        echo "  Endpoint  : $(wg_endpoint):${WG_PORT}"
+        echo "  Réseau VPN: ${WG_NET} (serveur ${WG_SERVER_IP})"
+        echo "  Pairs     : ${WG_PEERS}"
+        echo "  Profils   : lan (réseau privé + hôte) | backup (VM FILES seulement) | internet (Internet seulement)"
+        echo "  Config    : ./install.sh --run wg_show_peer <nom>   (clé privée : ne la diffuse pas)"
+        echo "  Samba VPN : \\\\${FILES_IP%%/*}\\SHARED (l'IP LAN ne fonctionne pas via le VPN)"
+        echo "  Gestion   : ./install.sh --run wg_add_peer|wg_add_device|wg_add_exit|wg_list_peers|wg_status"
         echo
     fi
 

@@ -13,6 +13,8 @@ ct/10-common.sh
 ct/20-swag.sh
 ct/30-xmrig-host.sh
 ct/40-xmrig.sh
+ct/50-wireguard.sh
 verify/10-verify.sh
 verify/20-summary.sh
+tools/10-repair.sh
 main.sh

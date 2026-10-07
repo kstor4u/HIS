@@ -2,6 +2,64 @@
 #                              SWAG                                           #
 ###############################################################################
 
+# Conf nginx SWAG du sous-domaine media -> Jellyfin (affichée sur stdout).
+swag_media_conf() {
+    cat <<CONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    server_name media.${DOMAIN};
+
+    include /config/nginx/ssl.conf;
+
+    client_max_body_size 0;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        proxy_pass http://${DOCKER_IP%%/*}:${JELLYFIN_HTTP_PORT};
+    }
+}
+CONF
+}
+
+# Vérifie que Let's Encrypt a bien émis le certificat. Si l'émission échoue,
+# SWAG démarre quand même avec un certificat AUTO-SIGNÉ (Firefox affiche
+# MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT) : sans cette vérification l'échec
+# reste silencieux. N'interrompt jamais l'installation (simple avertissement).
+# Utilisable seule : ./install.sh --run verify_swag_certificate
+verify_swag_certificate() {
+
+    local attempt
+
+    info "SWAG : attente de l'émission du certificat Let's Encrypt (jusqu'à 3 min)..."
+
+    for ((attempt = 1; attempt <= 18; attempt++)); do
+
+        if pct exec "$SWAG_ID" -- bash -c "docker exec swag openssl x509 -noout -issuer -in /config/etc/letsencrypt/live/${DOMAIN}/fullchain.pem 2>/dev/null | grep -qi \"Let's Encrypt\""; then
+            info "SWAG : certificat Let's Encrypt émis pour ${DOMAIN} (et ses sous-domaines)."
+            return 0
+        fi
+
+        sleep 10
+    done
+
+    warn "SWAG : AUCUN certificat Let's Encrypt émis : SWAG sert un certificat auto-signé."
+    warn "Raison probable (journaux SWAG) :"
+
+    pct exec "$SWAG_ID" -- bash -c "
+        docker logs swag 2>&1 | grep -iE 'error|failed|challenge|unauthorized|timeout|caa|too many|rate limit|retry after|invalid' | tail -n 12
+        docker exec swag tail -n 60 /config/log/letsencrypt/letsencrypt.log 2>/dev/null | grep -iE 'detail|problem|too many|caa|retry after' | tail -n 8
+    " || true
+
+    warn "À vérifier : enregistrements A (${DOMAIN}, cloud, sync, photos), redirection TCP 80 ET 443 de la box vers ${LAN_IP}."
+    warn "Après correction : pct exec ${SWAG_ID} -- docker restart swag  (puis ./install.sh --run verify_swag_certificate)."
+    warn "Rappel : Let's Encrypt limite à 5 échecs/heure et 5 certificats identiques/semaine (réinstallations répétées)."
+
+    return 0
+}
+
 create_swag_ct() {
 
     if pct status "$SWAG_ID" >/dev/null 2>&1; then
@@ -36,6 +94,18 @@ create_swag_ct() {
 
     local SCRIPT
     SCRIPT="$(mktemp)"
+
+    # Sous-domaines du certificat : media (Jellyfin) seulement s'il est activé.
+    local SWAG_SUBDOMAINS="cloud,sync,photos"
+    local MEDIA_BLOCK=""
+
+    if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
+        SWAG_SUBDOMAINS+=",media"
+        MEDIA_BLOCK="cat > /opt/swag/config/nginx/site-confs/media.conf <<'CONF_EOF'
+$(swag_media_conf)
+CONF_EOF
+"
+    fi
 
     cat > "$SCRIPT" <<EOF
 #!/usr/bin/env bash
@@ -91,7 +161,7 @@ services:
       - PGID=0
       - TZ=Europe/Paris
       - URL=${DOMAIN}
-      - SUBDOMAINS=cloud,sync,photos
+      - SUBDOMAINS=${SWAG_SUBDOMAINS}
       - VALIDATION=http
       - EMAIL=${LE_EMAIL}
       - STAGING=false
@@ -176,7 +246,7 @@ server {
 }
 CONF_EOF
 
-docker compose restart swag
+${MEDIA_BLOCK}docker compose restart swag
 
 docker compose ps
 EOF
@@ -192,5 +262,7 @@ EOF
     rm -f "$SCRIPT"
 
     info "SWAG installé dans le CT ${SWAG_ID}."
+
+    verify_swag_certificate
 }
 

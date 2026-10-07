@@ -49,6 +49,10 @@ propose_cleanup_existing() {
         existing_cts+=("${SWAG_ID}:SWAG")
     fi
 
+    if [[ "$ENABLE_WIREGUARD" == "true" ]] && pct status "$WG_ID" >/dev/null 2>&1; then
+        existing_cts+=("${WG_ID}:WIREGUARD")
+    fi
+
     if [[ "$ENABLE_XMRIG" == "true" ]] && pct status "$XMRIG_ID" >/dev/null 2>&1; then
         existing_cts+=("${XMRIG_ID}:XMRIG")
     fi

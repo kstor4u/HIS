@@ -85,19 +85,20 @@ add_dnat_forward() {
     local host_port="$1"
     local dest_ip="$2"
     local dest_port="$3"
+    local proto="${4:-tcp}"
 
     if ! iptables -t nat -C PREROUTING \
         -d "${LAN_IP}" \
-        -p tcp --dport "$host_port" \
+        -p "$proto" --dport "$host_port" \
         -j DNAT --to-destination "${dest_ip}:${dest_port}" >/dev/null 2>&1; then
 
         iptables -t nat -A PREROUTING \
             -d "${LAN_IP}" \
-            -p tcp --dport "$host_port" \
+            -p "$proto" --dport "$host_port" \
             -j DNAT --to-destination "${dest_ip}:${dest_port}"
     fi
 
-    info "  ${LAN_IP}:${host_port} -> ${dest_ip}:${dest_port}"
+    info "  ${LAN_IP}:${host_port}/${proto} -> ${dest_ip}:${dest_port}"
 }
 
 # Samba (445, + 139 pour compat élargie) : \\<IP hôte>\SHARED depuis le LAN.

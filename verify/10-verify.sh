@@ -143,6 +143,12 @@ verify_installation() {
         pct config "$SWAG_ID"
     fi
 
+    if [[ "$ENABLE_WIREGUARD" == "true" ]]; then
+
+        info "CT WIREGUARD :"
+        pct config "$WG_ID"
+    fi
+
     if [[ "$ENABLE_XMRIG" == "true" ]]; then
 
         echo

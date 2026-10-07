@@ -49,6 +49,10 @@ main() {
         create_swag_ct
     fi
 
+    if [[ "$ENABLE_WIREGUARD" == "true" ]]; then
+        deploy_wireguard
+    fi
+
     if [[ "$ENABLE_XMRIG" == "true" ]]; then
         configure_hugepages
         configure_msr_optimization
@@ -66,4 +70,16 @@ main() {
     show_summary
 }
 
-main "$@"
+if [[ "${1:-}" == "--run" ]]; then
+    # Exécute une seule fonction (réparations à chaud, voir tools/10-repair.sh)
+    # ANSWERS_FILE valait "--run" (premier argument) : on revient au fichier par
+    # défaut et on le charge s'il existe (DOMAIN, ENABLE_*, etc. cohérents).
+    shift
+    ANSWERS_FILE="./proxmox-homelab-answers.conf"
+    if [[ -f "$ANSWERS_FILE" ]]; then
+        load_answers_file
+    fi
+    "$@"
+else
+    main "$@"
+fi

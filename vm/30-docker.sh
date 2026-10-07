@@ -121,9 +121,15 @@ write_files:
       mkdir -p \
           /opt/apps/nextcloud \
           /opt/apps/syncin \
+          /opt/apps/syncin/data \
           /opt/apps/immich \
           /opt/apps/homeassistant \
           /opt/apps/jellyfin
+
+      # Données internes de Sync-in (users/spaces/tmp) : volontairement HORS
+      # de SHARED pour ne pas y créer ses dossiers techniques.
+      chown ${DOCKER_APPS_UID}:${SHARED_GID} /opt/apps/syncin/data
+      chmod 2770 /opt/apps/syncin/data
 EOF
 
     if [[ "$ENABLE_NEXTCLOUD" == "true" ]]; then
@@ -167,6 +173,7 @@ EOF
             - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
             - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
             - NEXTCLOUD_TRUSTED_DOMAINS=cloud.${DOMAIN} ${DOCKER_IP%%/*} ${LAN_IP}
+            - TRUSTED_PROXIES=${SWAG_IP%%/*}
             - TZ=Europe/Paris
           volumes:
             - nextcloud_html:/var/www/html
@@ -183,44 +190,9 @@ EOF
     fi
 
     # -------------------------------------------------------------------
-    # NEXTCLOUD - EXTERNAL STORAGE (étape manuelle, à faire après install)
+    # NEXTCLOUD - EXTERNAL STORAGE : automatisé, voir
+    # configure_nextcloud_external_storage() (appelée par start_docker_apps).
     # -------------------------------------------------------------------
-    #
-    # Le montage /srv/data:ro dans le conteneur nextcloud rend les fichiers
-    # visibles au processus PHP, mais Nextcloud ne les référence dans son
-    # arborescence utilisateur qu'une fois un point de montage "External
-    # Storage" créé via occ. Nextcloud met un peu de temps à finir son
-    # install (migrations DB) après le premier "docker compose up -d" :
-    # attends que `occ status` renvoie "installed: true" avant de lancer
-    # les commandes ci-dessous, sinon elles échoueront silencieusement.
-    #
-    # Depuis la VM DOCKER (103) :
-    #
-    #   # 1. Vérifier que l'install est terminée
-    #   docker exec -u www-data nextcloud php occ status
-    #
-    #   # 2. Activer l'app files_external (normalement déjà active)
-    #   docker exec -u www-data nextcloud php occ app:enable files_external
-    #
-    #   # 3. Créer un point de montage local par sous-dossier partagé
-    #   #    (syntaxe : occ files_external:create <nom> local null::null -c datadir=<chemin>)
-    #   docker exec -u www-data nextcloud php occ files_external:create "Family" local null::null -c datadir=/srv/data/Family
-    #   docker exec -u www-data nextcloud php occ files_external:create "Photo"  local null::null -c datadir=/srv/data/Photo
-    #   docker exec -u www-data nextcloud php occ files_external:create "Movies" local null::null -c datadir=/srv/data/Movies
-    #   docker exec -u www-data nextcloud php occ files_external:create "Music"  local null::null -c datadir=/srv/data/Music
-    #
-    #   # 4. Lister les montages pour récupérer leur ID numérique
-    #   docker exec -u www-data nextcloud php occ files_external:list
-    #
-    #   # 5. Les rendre visibles à un groupe (ex: admin), un par un, avec l'ID relevé à l'étape 4
-    #   docker exec -u www-data nextcloud php occ files_external:applicable --add-group="admin" <ID>
-    #
-    # Le montage est en lecture seule tant que /srv/data reste monté ":ro"
-    # dans docker-compose.yml (cohérent avec la phase de comparaison :
-    # cf. discussion sur l'écriture concurrente multi-apps). Pour autoriser
-    # l'écriture depuis Nextcloud plus tard, retire le ":ro" du volume dans
-    # le docker-compose.yml puis relance "docker compose up -d".
-    #
 
     if [[ "$ENABLE_SYNCIN" == "true" ]]; then
 
@@ -230,24 +202,20 @@ EOF
     owner: root:root
     permissions: '0644'
     content: |
-      # ATTENTION : le schéma exact de ce fichier n'est pas garanti à 100%.
-      # Sync-in est un projet jeune et ce squelette est reconstruit à partir
-      # de la documentation publique et de retours communautaires. Vérifie
-      # https://sync-in.com/docs/setup-guide/docker avant le premier
-      # démarrage et ajuste si besoin (les logs du conteneur syncin
-      # indiqueront une clé manquante ou mal nommée le cas échéant).
-      database:
-        type: mariadb
-        host: syncin-db
-        port: 3306
-        name: syncin
-        user: syncin
-        password: ${SYNCIN_DB_PASSWORD}
+      # Schéma Sync-in v2 : mysql.url, auth.encryptionKey, auth.token.*,
+      # applications.files.dataPath (cf. environment.dist.yaml du projet).
+      mysql:
+        url: mysql://syncin:${SYNCIN_DB_PASSWORD}@syncin-db:3306/syncin
       auth:
-        secret1: ${SYNCIN_SECRET_1}
-        secret2: ${SYNCIN_SECRET_2}
-        secret3: ${SYNCIN_SECRET_3}
-        secret4: ${SYNCIN_SECRET_4}
+        encryptionKey: ${SYNCIN_SECRET_1}
+        token:
+          access:
+            secret: ${SYNCIN_SECRET_2}
+          refresh:
+            secret: ${SYNCIN_SECRET_3}
+      applications:
+        files:
+          dataPath: /app/data
 
   - path: /opt/apps/syncin/docker-compose.yml
     owner: root:root
@@ -260,6 +228,7 @@ EOF
           image: mariadb:11
           container_name: syncin-db
           restart: unless-stopped
+          command: --innodb_ft_cache_size=16000000 --max-allowed-packet=1G
           environment:
             - MARIADB_DATABASE=syncin
             - MARIADB_USER=syncin
@@ -289,7 +258,11 @@ EOF
             - TZ=Europe/Paris
           volumes:
             - /opt/apps/syncin/environment.yaml:/app/environment/environment.yaml:ro
-            - ${DOCKER_SHARED_MOUNT}:/app/data
+            - /opt/apps/syncin/data:/app/data
+            # SHARED visible dans le conteneur au même chemin que partout :
+            # dans Sync-in (Admin > Spaces > racine externe), utiliser
+            # ${DOCKER_SHARED_MOUNT}/Family, /Photo, /Movies, /Music.
+            - ${DOCKER_SHARED_MOUNT}:${DOCKER_SHARED_MOUNT}:rw
           group_add:
             - "${SHARED_GID}"
           ports:
@@ -454,6 +427,84 @@ EOF
     chmod 600 "$SNIPPET"
 }
 
+# Exécute "occ" dans le conteneur Nextcloud via l'agent QEMU et affiche
+# stdout/stderr du guest (qm guest exec renvoie du JSON).
+nextcloud_occ() {
+
+    local VMID="$1"
+    shift
+
+    local raw
+
+    raw="$(qm guest exec "$VMID" --timeout 180 -- docker exec -u www-data nextcloud php occ "$@" 2>&1 || true)"
+
+    jq -r '.["out-data"] // empty, .["err-data"] // empty' <<< "$raw" 2>/dev/null || printf '%s\n' "$raw"
+}
+
+# Connecte Nextcloud aux sous-dossiers de SHARED (stockages externes
+# "local"). Idempotent : un montage déjà présent n'est pas recréé ni
+# modifié (les droits ajustés ensuite dans l'interface sont conservés).
+# À la création, chaque stockage est réservé au groupe "admin" ; les
+# autres utilisateurs/groupes s'ajoutent ensuite dans Paramètres
+# d'administration > Stockage externe > colonne "Disponible pour".
+configure_nextcloud_external_storage() {
+
+    local VMID="$1"
+    local attempt out folder mount_list storage_id
+    local ready=false
+
+    info "Attente de la fin d'installation de Nextcloud (occ status)..."
+
+    for ((attempt = 1; attempt <= 60; attempt++)); do
+
+        out="$(nextcloud_occ "$VMID" status)"
+
+        if grep -q 'installed: true' <<< "$out"; then
+            ready=true
+            break
+        fi
+
+        sleep 10
+    done
+
+    if [[ "$ready" != "true" ]]; then
+        warn "Nextcloud n'a pas fini son installation après 10 min : stockages externes non configurés. Relance-les plus tard avec : qm guest exec ${VMID} -- docker exec -u www-data nextcloud php occ files_external:list"
+        return 0
+    fi
+
+    # Nextcloud interdit par défaut la création de stockages "local".
+    nextcloud_occ "$VMID" config:system:set files_external_allow_create_new_local --value=true --type=boolean > /dev/null
+    nextcloud_occ "$VMID" app:enable files_external > /dev/null
+
+    mount_list="$(nextcloud_occ "$VMID" files_external:list)"
+
+    for folder in Family Photo Movies Music; do
+
+        if grep -q "/${folder} " <<< "$mount_list"; then
+            info "Nextcloud : stockage externe /${folder} déjà présent."
+            continue
+        fi
+
+        info "Nextcloud : stockage externe /${folder} -> ${DOCKER_SHARED_MOUNT}/${folder}"
+
+        out="$(nextcloud_occ "$VMID" files_external:create "$folder" local null::null -c "datadir=${DOCKER_SHARED_MOUNT}/${folder}")"
+
+        info "Nextcloud : ${out}"
+
+        storage_id="$(grep -oE '[0-9]+' <<< "$out" | tail -n 1 || true)"
+
+        if [[ -n "$storage_id" ]]; then
+            nextcloud_occ "$VMID" files_external:applicable --add-group="admin" "$storage_id" > /dev/null
+            info "Nextcloud : /${folder} (id ${storage_id}) réservé au groupe admin."
+        else
+            warn "ID du stockage /${folder} introuvable : il reste visible de tous les utilisateurs, à restreindre dans l'interface."
+        fi
+    done
+
+    info "Stockages externes Nextcloud :"
+    nextcloud_occ "$VMID" files_external:list
+}
+
 # Démarre les 3 stacks Docker depuis l'hôte, une par une, APRÈS le
 # redémarrage qui attache le VirtioFS. Volontairement PAS dans le runcmd
 # du premier boot : si le cumul des téléchargements d'images dépasse la
@@ -478,6 +529,8 @@ start_docker_apps() {
 
         if ! timeout 1800 qm guest exec "$VMID" -- bash -c "cd /opt/apps/nextcloud && docker compose up -d"; then
             warn "Échec du démarrage de Nextcloud. Vérifie : qm guest exec ${VMID} -- docker compose -f /opt/apps/nextcloud/docker-compose.yml logs"
+        else
+            configure_nextcloud_external_storage "$VMID"
         fi
     fi
 
