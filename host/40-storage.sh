@@ -152,6 +152,28 @@ prepare_data_disk() {
 #                              DATA TREE                                      #
 ###############################################################################
 
+# Crée les dossiers de DONNÉES des applications sur SHARED, avec des droits qui
+# permettent à chaque conteneur (groupe fileshare, ACL par défaut) d'y écrire.
+# Appelée à l'installation et par la migration (repair_apps_data_location).
+prepare_apps_data_dirs() {
+
+    local apps="${SHARED_DIR}/${APPS_DATA_SUBDIR}"
+    local d
+
+    mkdir -p \
+        "${SHARED_DIR}/${IMMICH_UPLOAD_SUBDIR}" \
+        "${apps}/syncin" \
+        "${apps}/nextcloud"
+
+    for d in "$apps" "${apps}/syncin" "${apps}/nextcloud" "${SHARED_DIR}/${IMMICH_UPLOAD_SUBDIR}"; do
+        chgrp "$SHARED_GROUP" "$d"
+        chmod 2770 "$d"
+    done
+
+    # Nextcloud (www-data = uid 33 dans l'image) doit être propriétaire de son dossier de données.
+    chown 33:"$SHARED_GID" "${apps}/nextcloud"
+}
+
 create_data_tree() {
 
     info "Création de l'arborescence DATA..."
@@ -197,6 +219,8 @@ create_data_tree() {
     setfacl -R -m "g:${SHARED_GROUP}:rwx" "$SHARED_DIR"
     setfacl -R -d -m "g:${SHARED_GROUP}:rwx" "$SHARED_DIR"
     setfacl -R -d -m "m:rwx" "$SHARED_DIR"
+
+    prepare_apps_data_dirs
 
     chown root:"$SHARED_GROUP" "$PROXMOX_DATA_DIR"
     chmod 0755 "$PROXMOX_DATA_DIR"

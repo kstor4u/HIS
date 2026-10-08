@@ -15,6 +15,7 @@ main() {
 
     configure_repositories
     install_host_dependencies
+    disable_subscription_nag
     configure_fail2ban_host
 
     configure_private_bridge

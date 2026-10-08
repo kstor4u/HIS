@@ -25,6 +25,9 @@
 #   wg_add_exit <nom> <fichier.conf>       wg_list_exits    wg_test_exits
 #   wg_set_exit <pair> <sortie|direct>     wg_status        wg_update_cli
 
+# Chemin ABSOLU obligatoire : "pct exec" n'a pas /usr/local/sbin dans son PATH.
+WG_CLI="/usr/local/sbin/wg-homelab"
+
 # Valeurs par défaut calculées à l'exécution (LAN_IP / DOMAIN peuvent changer
 # pendant la configuration interactive).
 wg_endpoint()     { printf '%s' "${WG_ENDPOINT:-$DOMAIN}"; }
@@ -67,6 +70,9 @@ wireguard_cli_script() {
 #!/usr/bin/env bash
 # wg-homelab : gestion du serveur WireGuard du homelab (exécuté dans le CT).
 set -Eeuo pipefail
+
+# Lancé par "pct exec" (PATH minimal) ou par wg-quick : PATH explicite.
+export PATH="${PATH:+${PATH}:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 WGDIR="${WGDIR:-/etc/wireguard}"
 CONF="${WGDIR}/wg0.conf"
@@ -608,8 +614,11 @@ wg_push_files() {
 
     tmp="$(mktemp)"
     wireguard_cli_script > "$tmp"
-    pct push "$WG_ID" "$tmp" /usr/local/sbin/wg-homelab --perms 0700
+    pct push "$WG_ID" "$tmp" "$WG_CLI" --perms 0700
     rm -f "$tmp"
+
+    pct exec "$WG_ID" -- test -x "$WG_CLI" \
+        || die "Le CLI ${WG_CLI} est absent ou non exécutable dans le CT ${WG_ID}."
 }
 
 # ----------------------------------------------------------------------------
@@ -620,7 +629,10 @@ create_wireguard_ct() {
 
     if pct status "$WG_ID" >/dev/null 2>&1; then
 
-        warn "CT ${WG_ID} existe déjà. Création WireGuard ignorée (mise à jour du CLI : ./install.sh --run wg_update_cli)."
+        warn "CT ${WG_ID} existe déjà : création ignorée, mise à jour du CLI et de l'environnement."
+
+        pct start "$WG_ID" >/dev/null 2>&1 || true
+        wg_push_files
 
         return 0
     fi
@@ -662,6 +674,10 @@ create_wireguard_ct() {
     rm -f "$SCRIPT"
 
     info "WireGuard installé dans le CT ${WG_ID}."
+}
+
+# Crée les pairs de WG_PEERS ("nom:profil") absents. Relançable sans risque.
+wg_create_default_peers() {
 
     local entry name profile
 
@@ -675,7 +691,7 @@ create_wireguard_ct() {
             continue
         fi
 
-        pct exec "$WG_ID" -- wg-homelab add "$name" "$profile"
+        pct exec "$WG_ID" -- "$WG_CLI" add "$name" "$profile"
     done
 }
 
@@ -698,6 +714,7 @@ deploy_wireguard() {
 
     configure_wireguard_host
     create_wireguard_ct
+    wg_create_default_peers
     verify_wireguard
 }
 
@@ -705,15 +722,15 @@ deploy_wireguard() {
 # Commandes de gestion depuis l'hôte : ./install.sh --run wg_<commande>
 # ----------------------------------------------------------------------------
 
-wg_add_peer()    { pct exec "$WG_ID" -- wg-homelab add "$@"; }
-wg_add_device()  { pct exec "$WG_ID" -- wg-homelab add-device "$@"; }
-wg_show_peer()   { pct exec "$WG_ID" -- wg-homelab show "$@"; }
-wg_remove_peer() { pct exec "$WG_ID" -- wg-homelab remove "$@"; }
-wg_list_peers()  { pct exec "$WG_ID" -- wg-homelab list; }
-wg_set_exit()    { pct exec "$WG_ID" -- wg-homelab set-exit "$@"; }
-wg_list_exits()  { pct exec "$WG_ID" -- wg-homelab exit-list; }
-wg_test_exits()  { pct exec "$WG_ID" -- wg-homelab exit-test; }
-wg_status()      { pct exec "$WG_ID" -- wg-homelab status; }
+wg_add_peer()    { pct exec "$WG_ID" -- "$WG_CLI" add "$@"; }
+wg_add_device()  { pct exec "$WG_ID" -- "$WG_CLI" add-device "$@"; }
+wg_show_peer()   { pct exec "$WG_ID" -- "$WG_CLI" show "$@"; }
+wg_remove_peer() { pct exec "$WG_ID" -- "$WG_CLI" remove "$@"; }
+wg_list_peers()  { pct exec "$WG_ID" -- "$WG_CLI" list; }
+wg_set_exit()    { pct exec "$WG_ID" -- "$WG_CLI" set-exit "$@"; }
+wg_list_exits()  { pct exec "$WG_ID" -- "$WG_CLI" exit-list; }
+wg_test_exits()  { pct exec "$WG_ID" -- "$WG_CLI" exit-test; }
+wg_status()      { pct exec "$WG_ID" -- "$WG_CLI" status; }
 
 # Importe une configuration WireGuard de fournisseur VPN comme sortie.
 # Usage : wg_add_exit <nom> </chemin/fichier.conf>
@@ -724,7 +741,7 @@ wg_add_exit() {
     [[ -n "$name" && -f "$file" ]] || die "Usage : wg_add_exit <nom> </chemin/fichier.conf>"
 
     pct push "$WG_ID" "$file" "/root/exit-${name}.conf" --perms 0600
-    pct exec "$WG_ID" -- wg-homelab exit-add "$name" "/root/exit-${name}.conf" || {
+    pct exec "$WG_ID" -- "$WG_CLI" exit-add "$name" "/root/exit-${name}.conf" || {
         pct exec "$WG_ID" -- rm -f "/root/exit-${name}.conf"
         die "Import de la sortie '${name}' échoué."
     }
@@ -737,6 +754,6 @@ wg_add_exit() {
 wg_update_cli() {
 
     wg_push_files
-    pct exec "$WG_ID" -- wg-homelab fw-up
+    pct exec "$WG_ID" -- "$WG_CLI" fw-up
     info "WireGuard : CLI et environnement mis à jour dans le CT ${WG_ID}."
 }

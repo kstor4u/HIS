@@ -137,3 +137,67 @@ install_host_dependencies() {
     info "virtiofsd vérifié : /usr/libexec/virtiofsd"
 }
 
+# Neutralise la fenêtre "You do not have a valid subscription for this server"
+# de l'interface web (proxmox-widget-toolkit). Le contrôle est modifié pour ne
+# jamais conclure à une absence d'abonnement : la fenêtre n'apparaît plus ET la
+# commande qu'elle protège s'exécute normalement (contrairement au correctif
+# répandu qui remplace Ext.Msg.show par void() et empêche cette commande).
+# Un hook APT réapplique le correctif après chaque mise à jour du paquet.
+# Si la structure du fichier est inconnue (nouvelle version), rien n'est modifié.
+# Annuler : apt reinstall proxmox-widget-toolkit (et supprimer le hook APT).
+disable_subscription_nag() {
+
+    if [[ "${DISABLE_SUBSCRIPTION_NAG:-true}" != "true" ]]; then
+        info "Fenêtre d'abonnement Proxmox : laissée telle quelle (DISABLE_SUBSCRIPTION_NAG=false)."
+        return 0
+    fi
+
+    local TOOL="/usr/local/sbin/proxmox-no-nag"
+    local HOOK="/etc/apt/apt.conf.d/99-proxmox-no-nag"
+
+    info "Fenêtre d'abonnement Proxmox : neutralisation..."
+
+    cat > "$TOOL" <<'NAGTOOL'
+#!/usr/bin/env bash
+# Neutralise la fenêtre "No valid subscription" de l'interface web Proxmox.
+# Réappliqué après chaque mise à jour de proxmox-widget-toolkit (hook APT).
+JS="${PVE_JS:-/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js}"
+MARK="__nag_disabled__"
+
+[[ -f "$JS" ]] || exit 0
+
+# Déjà neutralisé
+if grep -q "$MARK" "$JS"; then
+    exit 0
+fi
+
+PATTERN="(res === null \|\| res === undefined \|\| !res \|\| res\s*\.data\.status\.toLowerCase\(\) )!== 'active'"
+
+if ! grep -Pzq 'res === null \|\| res === undefined \|\| !res \|\| res\s*\.data\.status\.toLowerCase\(\) !== .active.' "$JS"; then
+    echo "proxmox-no-nag : structure de proxmoxlib.js inconnue (nouvelle version ?), aucune modification." >&2
+    exit 0
+fi
+
+[[ -f "${JS}.bak" ]] || cp -a "$JS" "${JS}.bak"
+
+sed -Ezi "s/${PATTERN}/\1=== '${MARK}'/" "$JS"
+
+if grep -q "$MARK" "$JS"; then
+    echo "proxmox-no-nag : fenêtre d'abonnement neutralisée."
+    systemctl restart pveproxy 2>/dev/null || true
+fi
+
+exit 0
+NAGTOOL
+
+    chmod 0755 "$TOOL"
+
+    cat > "$HOOK" <<NAGHOOK
+// Réapplique la neutralisation de la fenêtre d'abonnement après chaque mise à jour APT.
+DPkg::Post-Invoke { "${TOOL} || true"; };
+NAGHOOK
+
+    "$TOOL" || true
+
+    info "Fenêtre d'abonnement : actualise le navigateur avec Ctrl+F5 pour recharger l'interface."
+}

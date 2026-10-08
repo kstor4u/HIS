@@ -121,15 +121,9 @@ write_files:
       mkdir -p \
           /opt/apps/nextcloud \
           /opt/apps/syncin \
-          /opt/apps/syncin/data \
           /opt/apps/immich \
           /opt/apps/homeassistant \
           /opt/apps/jellyfin
-
-      # Données internes de Sync-in (users/spaces/tmp) : volontairement HORS
-      # de SHARED pour ne pas y créer ses dossiers techniques.
-      chown ${DOCKER_APPS_UID}:${SHARED_GID} /opt/apps/syncin/data
-      chmod 2770 /opt/apps/syncin/data
 EOF
 
     if [[ "$ENABLE_NEXTCLOUD" == "true" ]]; then
@@ -174,6 +168,7 @@ EOF
             - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
             - NEXTCLOUD_TRUSTED_DOMAINS=cloud.${DOMAIN} ${DOCKER_IP%%/*} ${LAN_IP}
             - TRUSTED_PROXIES=${SWAG_IP%%/*}
+            - NEXTCLOUD_DATA_DIR=${DOCKER_SHARED_MOUNT}/${APPS_DATA_SUBDIR}/nextcloud
             - TZ=Europe/Paris
           volumes:
             - nextcloud_html:/var/www/html
@@ -258,7 +253,8 @@ EOF
             - TZ=Europe/Paris
           volumes:
             - /opt/apps/syncin/environment.yaml:/app/environment/environment.yaml:ro
-            - /opt/apps/syncin/data:/app/data
+            # Données internes de Sync-in (users/spaces/tmp) : sur SHARED, dans un dossier caché.
+            - ${DOCKER_SHARED_MOUNT}/${APPS_DATA_SUBDIR}/syncin:/app/data
             # SHARED visible dans le conteneur au même chemin que partout :
             # dans Sync-in (Admin > Spaces > racine externe), utiliser
             # ${DOCKER_SHARED_MOUNT}/Family, /Photo, /Movies, /Music.
@@ -303,7 +299,8 @@ EOF
             - REDIS_HOSTNAME=immich-redis
             - TZ=Europe/Paris
           volumes:
-            - immich_upload:/usr/src/app/upload
+            # Les versions actuelles d'Immich lisent/écrivent UNIQUEMENT dans /data.
+            - ${DOCKER_SHARED_MOUNT}/${IMMICH_UPLOAD_SUBDIR}:/data
             - ${DOCKER_SHARED_MOUNT}/Photo:/mnt/external/photo:rw
             - /etc/localtime:/etc/localtime:ro
           group_add:
@@ -346,7 +343,6 @@ EOF
             retries: 20
 
       volumes:
-        immich_upload:
         immich_model_cache:
         immich_db:
 EOF

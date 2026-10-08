@@ -28,7 +28,7 @@ export DEBIAN_FRONTEND=noninteractive
 #                              CONFIGURATION                                  #
 ###############################################################################
 
-SCRIPT_VERSION="2.27.0"
+SCRIPT_VERSION="2.28.1"
 
 # ---------------------------------------------------------------------------
 # Modules
@@ -39,6 +39,10 @@ ENABLE_DOCKER=true
 ENABLE_FILES=true
 ENABLE_XMRIG=true
 ENABLE_WIREGUARD=true
+
+# Masque la fenêtre "No valid subscription" de l'interface web Proxmox.
+# Purement local à l'interface (proxmoxlib.js) ; annulable : apt reinstall proxmox-widget-toolkit
+DISABLE_SUBSCRIPTION_NAG=true
 
 # ---------------------------------------------------------------------------
 # Proxmox
@@ -141,6 +145,12 @@ DOCKER_DISK="32G"
 # ré-export réseau (NFS/Samba) depuis la VM FILES. Les conteneurs utilisent
 # le GID ${SHARED_GID} via group_add pour respecter les permissions du partage.
 DOCKER_SHARED_MOUNT="/srv/data"
+
+# Emplacements (relatifs à SHARED, donc sur le disque DATA et non dans les VM)
+# des DONNÉES des applications. Restent volontairement en local dans la VM :
+# bases de données (Postgres/MariaDB/SQLite), caches, configurations.
+IMMICH_UPLOAD_SUBDIR="Photo/Immich"   # photos importées, miniatures, vidéos encodées
+APPS_DATA_SUBDIR=".apps"              # dossier CACHÉ (invisible en SMB) : syncin, nextcloud
 
 # ---------------------------------------------------------------------------
 # DOCKER APPS - Nextcloud / Sync-in / Immich / Home Assistant / Jellyfin
