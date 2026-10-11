@@ -1,0 +1,5 @@
+# Fins de ligne : toujours LF (les scripts bash cassent avec du CRLF sous Linux).
+* text=auto eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+MANIFEST text eol=lf

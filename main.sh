@@ -10,7 +10,7 @@ main() {
     load_answers_file
     configure_lan_ip_interactive
 
-    propose_cleanup_existing
+    resolve_service_modes
     configure_variables
 
     configure_repositories
@@ -80,6 +80,7 @@ if [[ "${1:-}" == "--run" ]]; then
     if [[ -f "$ANSWERS_FILE" ]]; then
         load_answers_file
     fi
+    normalize_service_flags
     "$@"
 else
     main "$@"

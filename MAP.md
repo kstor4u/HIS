@@ -8,7 +8,7 @@ Chargement dans l'ordre de `MANIFEST` via `install.sh`. `./build.sh > fichier.sh
 |---|---|---|
 | `core/00-config.sh` | 350 | Toutes les variables de config (IDs, IP, ressources, ports, apps, XMRIG, domaine) + HOST_PACKAGES + globales. Fonctions : `detect_lan_ip`:61 |
 | `core/10-logging-checks.sh` | 73 | Logging (tee), log/info/warn/die, trap ERR, check_root, check_proxmox. Fonctions : `log`:11, `info`:21, `warn`:25, `die`:29, `check_root`:48, `check_proxmox`:53 |
-| `core/20-answers-cleanup.sh` | 125 | Fichier de réponses (.conf) + proposition de suppression des VM/CT existants. Fonctions : `load_answers_file`:8, `propose_cleanup_existing`:33 |
+| `core/20-answers-cleanup.sh` | 228 | Fichier de réponses (.conf) + décision par service (ENABLE_* = keep/cleanup/remove) et suppression des VM/CT existants. Fonctions : `load_answers_file`:8, `service_mode_parse`:34, `destroy_homelab_resource`:50, `purge_service_leftovers`:85, `resolve_service_modes`:115, `normalize_service_flags`:214 |
 | `core/30-variables-secrets.sh` | 284 | configure_variables (questions interactives) + generate_app_secrets. Fonctions : `configure_variables`:5, `generate_app_secrets`:250 |
 | `host/10-apt.sh` | 203 | Dépôts APT Proxmox + dépendances hôte (simulation APT sécurisée) + disable_subscription_nag (fenêtre d'abonnement). Fonctions : `configure_repositories`:5, `install_host_dependencies`:46, `disable_subscription_nag`:148 |
 | `host/20-bridges-lan.sh` | 286 | vmbr1 privé, bascule LAN DHCP/statique, IP LAN interactive. Fonctions : `configure_private_bridge`:5, `switch_lan_to_dhcp`:45, `detect_lan_mode`:107, `switch_lan_to_static`:125, `configure_lan_ip_interactive`:199 |
@@ -41,3 +41,5 @@ Chargement dans l'ordre de `MANIFEST` via `install.sh`. `./build.sh > fichier.sh
 - VPN WireGuard (pairs, profils, sorties fournisseur) → `ct/50-wireguard.sh` ; variables WG_* dans `core/00-config.sh`
 - Résumé final affiché → `verify/20-summary.sh`
 - Corriger une VM DÉJÀ créée (cloud-init ne rejoue pas) → `tools/10-repair.sh` + `./install.sh --run <fonction>`
+- Sauvegarde/restauration des certificats Let's Encrypt (évite la limite 5/semaine en réinstallant) → `tools/10-repair.sh` : `swag_backup_certs`, `swag_restore_certs` ; variable `SWAG_CERT_BACKUP` dans `core/00-config.sh`
+- Installer / conserver / recréer / retirer un service (FILES, DOCKER, SWAG, WIREGUARD, XMRIG) → variables `ENABLE_*` (keep|cleanup|remove) dans `core/00-config.sh` ou le fichier de réponses ; logique dans `core/20-answers-cleanup.sh` (`resolve_service_modes`)

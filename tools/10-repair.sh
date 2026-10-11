@@ -14,6 +14,10 @@
 #   ./install.sh --run repair_nextcloud_proxy       # Nextcloud derrière SWAG
 #   ./install.sh --run repair_swag_add_media        # media.<domaine> -> Jellyfin + certificat
 #   ./install.sh --run repair_apps_data_location    # données Immich/Sync-in -> SHARED
+#   ./install.sh --run repair_swag_add_photo_alias  # photo.<domaine> = alias de photos.<domaine> (Immich)
+#   ./install.sh --run swag_regenerate_certs [force] # (re)émet le certificat (force = repart de zéro)
+#   ./install.sh --run swag_backup_certs            # sauvegarde les certificats Let's Encrypt
+#   ./install.sh --run swag_restore_certs           # les restaure après une réinstallation
 #
 # (cloud-init ne rejoue jamais son runcmd : une correction du script ne
 # s'applique donc pas aux VM existantes sans passer par ces fonctions.)
@@ -198,8 +202,8 @@ repair_nextcloud_proxy() {
 check_letsencrypt() {
 
     local pub_ip name v4 v6 code
-    local -a names=("${DOMAIN}" "cloud.${DOMAIN}" "sync.${DOMAIN}" "photos.${DOMAIN}")
-    local -a web_names=("cloud.${DOMAIN}" "sync.${DOMAIN}" "photos.${DOMAIN}")
+    local -a names=("${DOMAIN}" "cloud.${DOMAIN}" "sync.${DOMAIN}" "photos.${DOMAIN}" "photo.${DOMAIN}")
+    local -a web_names=("cloud.${DOMAIN}" "sync.${DOMAIN}" "photos.${DOMAIN}" "photo.${DOMAIN}")
 
     if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
         names+=("media.${DOMAIN}")
@@ -382,4 +386,115 @@ repair_apps_data_location() {
     fi
 
     info "Nextcloud : non migré (ses fichiers sont dans le volume nextcloud_html ; les installations NEUVES utilisent SHARED/${APPS_DATA_SUBDIR}/nextcloud)."
+}
+
+# Sauvegarde les certificats Let's Encrypt de SWAG sur l'hôte (SWAG_CERT_BACKUP).
+# Appelée automatiquement quand un certificat vient d'être émis.
+swag_backup_certs() {
+
+    local tmp="/root/swag-letsencrypt.tgz"
+
+    if ! pct exec "$SWAG_ID" -- test -d /opt/swag/config/etc/letsencrypt/live; then
+        warn "SWAG : aucun certificat Let's Encrypt à sauvegarder (SWAG sert un certificat auto-signé)."
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$SWAG_CERT_BACKUP")"
+    chmod 700 "$(dirname "$SWAG_CERT_BACKUP")"
+
+    pct exec "$SWAG_ID" -- tar -C /opt/swag/config/etc -czf "$tmp" letsencrypt
+    pct pull "$SWAG_ID" "$tmp" "$SWAG_CERT_BACKUP"
+    pct exec "$SWAG_ID" -- rm -f "$tmp"
+    chmod 600 "$SWAG_CERT_BACKUP"
+
+    info "SWAG : certificats sauvegardés dans ${SWAG_CERT_BACKUP} (contient les clés privées : ne le diffuse pas)."
+}
+
+# Restaure les certificats sauvegardés dans un SWAG fraîchement réinstallé, puis
+# redémarre SWAG : il détecte un certificat valide et n'en redemande pas.
+swag_restore_certs() {
+
+    [[ -f "$SWAG_CERT_BACKUP" ]] \
+        || die "Aucune sauvegarde de certificats : ${SWAG_CERT_BACKUP} (voir swag_backup_certs)."
+
+    info "SWAG : restauration des certificats depuis ${SWAG_CERT_BACKUP}..."
+
+    pct push "$SWAG_ID" "$SWAG_CERT_BACKUP" /root/swag-letsencrypt.tgz --perms 0600
+
+    pct exec "$SWAG_ID" -- bash -c "
+        set -e
+        mkdir -p /opt/swag/config/etc
+        rm -rf /opt/swag/config/etc/letsencrypt
+        tar -C /opt/swag/config/etc -xzf /root/swag-letsencrypt.tgz
+        rm -f /root/swag-letsencrypt.tgz
+        cd /opt/swag && docker compose restart swag
+    "
+
+    sleep 30
+
+    verify_swag_certificate
+}
+
+# Ajoute photo.<domaine> comme alias de photos.<domaine> (Immich) dans SWAG :
+# sous-domaine du certificat + server_name, puis redémarrage (nouveau certificat
+# élargi, émis automatiquement par SWAG). Idempotent.
+repair_swag_add_photo_alias() {
+
+    local compose new_compose b64 conf
+
+    info "SWAG : ajout de photo.${DOMAIN} (alias de photos.${DOMAIN} -> Immich)..."
+
+    compose="$(pct exec "$SWAG_ID" -- cat /opt/swag/docker-compose.yml 2>/dev/null || true)"
+    [[ -n "$compose" ]] || die "docker-compose.yml de SWAG introuvable dans le CT ${SWAG_ID}."
+
+    if grep -qE 'SUBDOMAINS=.*\bphoto\b' <<< "$compose"; then
+        info "SWAG : photo déjà présent dans SUBDOMAINS."
+    else
+        new_compose="$(sed -E 's/^([[:space:]]*- SUBDOMAINS=.*)$/\1,photo/' <<< "$compose")"
+        [[ "$new_compose" != "$compose" ]] || die "Ligne SUBDOMAINS introuvable dans le compose de SWAG."
+
+        pct exec "$SWAG_ID" -- bash -c "cp -a /opt/swag/docker-compose.yml /opt/swag/docker-compose.yml.bak.\$(date +%s)"
+        b64="$(printf '%s\n' "$new_compose" | base64 -w0)"
+        pct exec "$SWAG_ID" -- bash -c "echo '${b64}' | base64 -d > /opt/swag/docker-compose.yml"
+        info "SWAG : SUBDOMAINS mis à jour (ancienne version sauvegardée en .bak)."
+    fi
+
+    conf=/opt/swag/config/nginx/site-confs/photos.conf
+
+    if pct exec "$SWAG_ID" -- grep -qE "server_name .*photo\.${DOMAIN//./\\.}" "$conf" 2>/dev/null; then
+        info "SWAG : photos.conf contient déjà l'alias."
+    else
+        pct exec "$SWAG_ID" -- sed -i -E "s/^([[:space:]]*server_name[[:space:]]+photos\.${DOMAIN//./\\.})[[:space:]]*;/\1 photo.${DOMAIN};/" "$conf" \
+            || die "Modification de ${conf} impossible."
+        pct exec "$SWAG_ID" -- grep -q "photo\.${DOMAIN//./\\.}" "$conf" \
+            || die "server_name de ${conf} non reconnu : ajoute 'photo.${DOMAIN}' à la main."
+        info "SWAG : photos.conf mis à jour."
+    fi
+
+    swag_regenerate_certs
+}
+
+# Redémarre SWAG pour (ré)émettre le certificat. SWAG ne redemande un certificat
+# que si la liste des sous-domaines a changé ou si le certificat est absent/proche
+# de l'expiration. "force" : sauvegarde puis SUPPRIME le certificat actuel pour
+# en obtenir un neuf (attention : limite Let's Encrypt de 5 certificats identiques
+# par semaine ; à n'utiliser qu'en cas de certificat cassé).
+swag_regenerate_certs() {
+
+    local mode="${1:-}"
+
+    if [[ "$mode" == "force" ]]; then
+        warn "Mode force : le certificat actuel va être supprimé puis redemandé (limite : 5 par semaine)."
+        swag_backup_certs || true
+        pct exec "$SWAG_ID" -- bash -c "rm -rf /opt/swag/config/etc/letsencrypt/live /opt/swag/config/etc/letsencrypt/archive /opt/swag/config/etc/letsencrypt/renewal"
+    fi
+
+    info "SWAG : redémarrage et émission du certificat (jusqu'à ~2 min)..."
+    pct exec "$SWAG_ID" -- bash -c "cd /opt/swag && docker compose up -d --force-recreate" | tail -n 5
+
+    sleep 60
+
+    pct exec "$SWAG_ID" -- bash -c "docker logs swag 2>&1 | grep -iE 'server ready|successfully|not yet due|error|failed|challenge|unauthorized|timeout' | tail -n 15" || true
+
+    verify_swag_certificate
 }

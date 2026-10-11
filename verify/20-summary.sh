@@ -74,7 +74,7 @@ show_summary() {
             echo "  Immich:"
             echo "    Local     : http://${DOCKER_IP%%/*}:${IMMICH_HTTP_PORT}"
             echo "    LAN       : http://${LAN_IP}:${IMMICH_HTTP_PORT}"
-            echo "    Via SWAG  : https://photos.${DOMAIN}"
+            echo "    Via SWAG  : https://photos.${DOMAIN} (alias : https://photo.${DOMAIN})"
             echo "    À faire   : créer le compte admin au premier accès, puis ajouter"
             echo "                /mnt/external/photo comme External Library"
             echo

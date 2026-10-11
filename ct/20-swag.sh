@@ -39,6 +39,12 @@ verify_swag_certificate() {
 
         if pct exec "$SWAG_ID" -- bash -c "docker exec swag openssl x509 -noout -issuer -in /config/etc/letsencrypt/live/${DOMAIN}/fullchain.pem 2>/dev/null | grep -qi \"Let's Encrypt\""; then
             info "SWAG : certificat Let's Encrypt émis pour ${DOMAIN} (et ses sous-domaines)."
+
+            # Sauvegarde sur l'hôte : permet de réinstaller sans redemander de certificat.
+            if declare -F swag_backup_certs >/dev/null; then
+                swag_backup_certs || true
+            fi
+
             return 0
         fi
 
@@ -53,7 +59,7 @@ verify_swag_certificate() {
         docker exec swag tail -n 60 /config/log/letsencrypt/letsencrypt.log 2>/dev/null | grep -iE 'detail|problem|too many|caa|retry after' | tail -n 8
     " || true
 
-    warn "À vérifier : enregistrements A (${DOMAIN}, cloud, sync, photos), redirection TCP 80 ET 443 de la box vers ${LAN_IP}."
+    warn "À vérifier : enregistrements A (${DOMAIN}, cloud, sync, photos, photo), redirection TCP 80 ET 443 de la box vers ${LAN_IP}."
     warn "Après correction : pct exec ${SWAG_ID} -- docker restart swag  (puis ./install.sh --run verify_swag_certificate)."
     warn "Rappel : Let's Encrypt limite à 5 échecs/heure et 5 certificats identiques/semaine (réinstallations répétées)."
 
@@ -96,7 +102,7 @@ create_swag_ct() {
     SCRIPT="$(mktemp)"
 
     # Sous-domaines du certificat : media (Jellyfin) seulement s'il est activé.
-    local SWAG_SUBDOMAINS="cloud,sync,photos"
+    local SWAG_SUBDOMAINS="cloud,sync,photos,photo"
     local MEDIA_BLOCK=""
 
     if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
@@ -232,7 +238,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
 
-    server_name photos.${DOMAIN};
+    server_name photos.${DOMAIN} photo.${DOMAIN};
 
     include /config/nginx/ssl.conf;
 

@@ -1,0 +1,5 @@
+# Ne jamais versionner les secrets ni les fichiers générés.
+*.conf
+*.log
+*.bak*
+proxmox-homelab-answers.conf

@@ -28,21 +28,33 @@ export DEBIAN_FRONTEND=noninteractive
 #                              CONFIGURATION                                  #
 ###############################################################################
 
-SCRIPT_VERSION="2.28.1"
+SCRIPT_VERSION="2.29.1"
 
 # ---------------------------------------------------------------------------
 # Modules
 # ---------------------------------------------------------------------------
 
-ENABLE_SWAG=true
-ENABLE_DOCKER=true
-ENABLE_FILES=true
-ENABLE_XMRIG=true
-ENABLE_WIREGUARD=true
+# Un seul réglage par service (lisible aussi depuis le fichier de réponses) :
+#   "keep"    = installe si absent ; conserve s'il existe déjà (création sautée)
+#   "cleanup" = supprime l'existant PUIS le recrée à neuf
+#   "remove"  = supprime l'existant et ne l'installe pas
+#   ""        = installe si absent ; s'il existe déjà, DEMANDE quoi faire
+# Alias : "true" = keep, "false" = remove. Le disque DATA n'est jamais touché.
+# Après resolve_service_modes(), ces variables valent toujours "true" ou "false".
+ENABLE_SWAG=""
+ENABLE_DOCKER=""
+ENABLE_FILES=""
+ENABLE_XMRIG=""
+ENABLE_WIREGUARD=""
 
 # Masque la fenêtre "No valid subscription" de l'interface web Proxmox.
 # Purement local à l'interface (proxmoxlib.js) ; annulable : apt reinstall proxmox-widget-toolkit
 DISABLE_SUBSCRIPTION_NAG=true
+
+# Sauvegarde des certificats Let's Encrypt de SWAG (clés privées : fichier root 0600).
+# Évite de redemander un certificat à chaque réinstallation (limite : 5 certificats
+# identiques par semaine). Voir swag_backup_certs / swag_restore_certs.
+SWAG_CERT_BACKUP="/var/lib/homelab/swag-letsencrypt.tgz"
 
 # ---------------------------------------------------------------------------
 # Proxmox
@@ -341,10 +353,4 @@ ANSWERS_FILE_LOADED=false
 
 # Confirmation de formatage du disque DATA, lisible depuis ANSWERS_FILE.
 FORMAT_CONFIRMATION=""
-
-# Suppression préalable des VM/CT homelab déjà existantes (voir
-# propose_cleanup_existing()). "" = demande interactive, "oui"/"true" =
-# supprime sans demander, toute autre valeur (ou vide en mode fichier) =
-# conserve sans demander.
-CLEANUP_EXISTING_VMS=""
 
