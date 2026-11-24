@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Point d'entrée modulaire : charge les modules listés dans MANIFEST (dans l'ordre)
-# puis lance main() (définie dans main.sh). Usage : ./install.sh [fichier-reponses.conf]
-_HL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-while IFS= read -r _m; do
-    [[ -z "$_m" ]] && continue
+# install.sh : lanceur de la version modulaire. Charge les modules listés dans MANIFEST, dans l'ordre, dans CE shell
+# (équivaut au script monolithe : ./build.sh > proxmox-homelab-install.sh). Usage identique : sudo ./install.sh [options]
+_HOMELAB_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while IFS= read -r _homelab_mod; do
+    [[ -z "$_homelab_mod" || "$_homelab_mod" == \#* ]] && continue
     # shellcheck disable=SC1090
-    source "${_HL_DIR}/${_m}"
-done < "${_HL_DIR}/MANIFEST"
+    source "${_HOMELAB_SRC_DIR}/${_homelab_mod}"
+done < "${_HOMELAB_SRC_DIR}/MANIFEST"

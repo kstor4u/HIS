@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Réseau du serveur de sauvegarde : passage du pont (vmbr0) en DHCP.
+#   homelab-backup-net dhcp [--now]   modifie /etc/network/interfaces (sauvegarde horodatée) et
+#                                     installe un « hook » qui garde /etc/hosts à jour avec l'IP reçue
+#                                     (Proxmox exige que le nom de la machine se résolve en son IP).
+#                                     Sans --now : appliqué au prochain démarrage (le plus sûr en SSH).
+#   homelab-backup-net status
+set -Eeuo pipefail
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+[[ -f "$HB_LIB" ]] && source "$HB_LIB" || true
+
+BRIDGE="${NETWORK_BRIDGE:-vmbr0}"
+IFACE_FILE="${IFACE_FILE:-/etc/network/interfaces}"
+HOOK="${HOOK_FILE:-/etc/dhcp/dhclient-exit-hooks.d/homelab-hosts}"
+
+method() {
+    awk -v b="$BRIDGE" '$0 ~ "^iface " b " inet (static|dhcp)" { print $4; exit }' "$IFACE_FILE"
+}
+
+install_hook() {
+    install -d "$(dirname "$HOOK")"
+    cat > "$HOOK" <<'HOOKEOF'
+# Généré par homelab-backup-net : Proxmox a besoin que le nom d'hôte se résolve en l'IP actuelle.
+case "${reason:-}" in
+    BOUND|RENEW|REBIND|REBOOT)
+        if [ -n "${new_ip_address:-}" ] && [ "${interface:-}" = "__BRIDGE__" ]; then
+            h="$(hostname)"
+            fqdn="$(hostname -f 2>/dev/null || echo "$h")"
+            tmp="$(mktemp)"
+            # supprime les anciennes lignes (hors boucle locale) portant ce nom d'hôte
+            awk -v h="$h" '$1 !~ /^127\./ && $1 != "::1" { for (i = 2; i <= NF; i++) if ($i == h) next } { print }' /etc/hosts > "$tmp"
+            echo "$new_ip_address $fqdn $h" >> "$tmp"
+            cat "$tmp" > /etc/hosts
+            rm -f "$tmp"
+        fi
+        ;;
+esac
+HOOKEOF
+    sed -i "s/__BRIDGE__/${BRIDGE}/" "$HOOK"
+    chmod 644 "$HOOK"
+}
+
+cmd_dhcp() {
+    local now=0; [[ "${1:-}" == "--now" ]] && now=1
+    [[ -f "$IFACE_FILE" ]] || { echo "$IFACE_FILE introuvable." >&2; exit 1; }
+
+    local m; m="$(method)"
+    [[ -n "$m" ]] || { echo "Pont $BRIDGE introuvable dans $IFACE_FILE (variable NETWORK_BRIDGE)." >&2; exit 1; }
+
+    install_hook
+
+    if [[ "$m" == "dhcp" ]]; then
+        echo "$BRIDGE est déjà en DHCP (hook /etc/hosts vérifié)."
+        return 0
+    fi
+
+    local bak="${IFACE_FILE}.bak-$(date +%Y%m%d%H%M%S)"
+    cp "$IFACE_FILE" "$bak"
+
+    awk -v iface="$BRIDGE" '
+        BEGIN { in_block = 0 }
+        $0 ~ "^iface " iface " inet static" { print "iface " iface " inet dhcp"; in_block = 1; next }
+        in_block && /^[[:space:]]*(address|netmask|gateway|broadcast|network)[[:space:]]/ { print "#" $0; next }
+        in_block && (/^$/ || /^auto / || /^iface /) { in_block = 0 }
+        { print }
+    ' "$IFACE_FILE" > "${IFACE_FILE}.new"
+    mv "${IFACE_FILE}.new" "$IFACE_FILE"
+
+    echo "$BRIDGE passe en DHCP (sauvegarde de l'ancienne configuration : $bak)."
+    echo "Retour en arrière : cp $bak $IFACE_FILE && ifreload -a   (depuis la console si le réseau ne répond plus)."
+
+    if (( now )); then
+        echo "Application immédiate (la connexion SSH peut se couper si l'IP change)..."
+        ifreload -a
+    else
+        echo "Appliqué au prochain démarrage du serveur (ou : homelab-backup-net dhcp --now)."
+        echo "Conseil : réserve une IP à ce serveur dans ta box (par adresse MAC) pour la retrouver facilement."
+    fi
+}
+
+case "${1:-}" in
+    dhcp)   shift; cmd_dhcp "$@" ;;
+    status) echo "$BRIDGE : $(method || true)"; ip -4 -br addr show "$BRIDGE" 2>/dev/null || true ;;
+    *)      echo "Usage : homelab-backup-net dhcp [--now] | status"; exit 1 ;;
+esac

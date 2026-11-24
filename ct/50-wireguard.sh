@@ -11,8 +11,16 @@
 #        lan       : le réseau privé des VM + l'hôte (Samba, SSH, Proxmox...)
 #        backup    : uniquement la VM FILES, ports WG_BACKUP_PORTS (sauvegardes)
 #        internet  : Internet uniquement, AUCUN accès au LAN ni aux VM
+#        tor       : Internet UNIQUEMENT à travers le réseau Tor (client Tor dans le CT) :
+#                    tout le TCP est redirigé de force vers Tor, le DNS aussi ; le reste
+#                    (UDP, QUIC, ICMP...) est bloqué ; aucune sortie directe possible
+#                    même si Tor est arrêté. Voir ENABLE_TOR.
 #    Les droits sont appliqués par le pare-feu du CT (chaîne WG_FWD), pas par
 #    la confiance accordée au client. Les pairs ne se voient pas entre eux.
+#  - CLIENT TOR : avec ENABLE_TOR, le CT fait tourner un client Tor (jamais un relais) :
+#        TransPort 9040 + DNSPort 5353 sur l'adresse VPN du serveur (profil tor),
+#        proxy SOCKS5 9050 (WG_TOR_SOCKS) pour les VM/CT du réseau privé (adresse du CT)
+#        et pour les pairs du profil lan (adresse VPN du serveur) : socks5h://ADRESSE:9050
 #  - SORTIES VPN : des configurations WireGuard d'un fournisseur (une par pays)
 #    sont importées comme interfaces wx-<nom>. Un pair "internet" peut être
 #    rattaché à une sortie (routage par IP source). Si la sortie tombe, le
@@ -24,6 +32,7 @@
 #   wg_show_peer <nom>      wg_remove_peer <nom>     wg_list_peers
 #   wg_add_exit <nom> <fichier.conf>       wg_list_exits    wg_test_exits
 #   wg_set_exit <pair> <sortie|direct>     wg_status        wg_update_cli
+#   wg_tor_setup (installe/réapplique le client Tor)   wg_test_tor (Tor actif ? IP de sortie)
 
 # Chemin ABSOLU obligatoire : "pct exec" n'a pas /usr/local/sbin dans son PATH.
 WG_CLI="/usr/local/sbin/wg-homelab"
@@ -32,7 +41,16 @@ WG_CLI="/usr/local/sbin/wg-homelab"
 # pendant la configuration interactive).
 wg_endpoint()     { printf '%s' "${WG_ENDPOINT:-$DOMAIN}"; }
 wg_lan_routes()   { printf '%s' "${WG_LAN_ROUTES:-${PRIVATE_NET},${LAN_IP}/32}"; }
-wg_backup_dests() { printf '%s' "${WG_BACKUP_DESTS:-${FILES_IP%%/*}}"; }
+# Profil backup : la VM FILES, et l'hôte Proxmox (rrsync du tirage) quand ENABLE_BACKUP_PULL est actif.
+wg_backup_dests() {
+    if [[ -n "${WG_BACKUP_DESTS:-}" ]]; then
+        printf '%s' "$WG_BACKUP_DESTS"
+    elif [[ "${ENABLE_BACKUP_PULL:-false}" == "true" ]]; then
+        printf '%s,%s' "${FILES_IP%%/*}" "$PRIVATE_GW"
+    else
+        printf '%s' "${FILES_IP%%/*}"
+    fi
+}
 
 # ----------------------------------------------------------------------------
 # Hôte : module noyau + redirection UDP
@@ -86,9 +104,14 @@ PRIV_NETS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10"
 PRIO_EXIT_MIN=11000              # règles "oif wx-*"   : 11000-11099
 PRIO_PEER_MIN=11100              # règles par pair     : 11100-11999
 PRIO_MAX=11999
+TOR_TRANSPORT=9040               # Tor : proxy transparent (profil tor)
+TOR_DNSPORT=5353                 # Tor : résolveur DNS
+TOR_SOCKS=9050                   # Tor : proxy SOCKS5
 
 # shellcheck disable=SC1091
 source "${WGDIR}/homelab.env"
+WG_TOR="${WG_TOR:-false}"
+WG_TOR_SOCKS="${WG_TOR_SOCKS:-false}"
 
 umask 077
 touch "$PEERS" "$EXITS"
@@ -117,6 +140,12 @@ fw_up() {
         iptables -N "$c" 2>/dev/null || true
         iptables -F "$c"
     done
+
+    # Profil tor : redirection forcée vers Tor (table nat)
+    iptables -t nat -N WG_TOR 2>/dev/null || true
+    iptables -t nat -F WG_TOR
+    iptables -t nat -C PREROUTING -i "$IFACE" -j WG_TOR 2>/dev/null \
+        || iptables -t nat -I PREROUTING 1 -i "$IFACE" -j WG_TOR
 
     iptables -C FORWARD -i "$IFACE" -j WG_FWD 2>/dev/null \
         || iptables -I FORWARD 1 -i "$IFACE" -j WG_FWD
@@ -163,6 +192,19 @@ fw_up() {
                 for dest in ${WG_LAN_ROUTES//,/ }; do
                     iptables -A WG_FWD -s "${ip}/32" -d "$dest" -j ACCEPT
                 done
+                # Proxy SOCKS5 de Tor, joignable à l'adresse VPN du serveur
+                if [[ "$WG_TOR" == "true" && "$WG_TOR_SOCKS" == "true" ]]; then
+                    iptables -I WG_IN 1 -s "${ip}/32" -p tcp --dport "$TOR_SOCKS" -j ACCEPT
+                fi
+                ;;
+            tor)
+                # TCP -> TransPort de Tor, DNS (UDP 53) -> DNSPort ; tout le reste est bloqué.
+                # Si Tor est arrêté, les connexions échouent : jamais de repli sur l'IP du homelab.
+                iptables -t nat -A WG_TOR -s "${ip}/32" -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNSPORT"
+                iptables -t nat -A WG_TOR -s "${ip}/32" -p tcp --syn -j REDIRECT --to-ports "$TOR_TRANSPORT"
+                iptables -I WG_IN 1 -s "${ip}/32" -p udp --dport "$TOR_DNSPORT" -j ACCEPT
+                iptables -I WG_IN 1 -s "${ip}/32" -p tcp --dport "$TOR_TRANSPORT" -j ACCEPT
+                iptables -A WG_FWD -s "${ip}/32" -j DROP
                 ;;
             backup)
                 for dest in ${WG_BACKUP_DESTS//,/ }; do
@@ -170,6 +212,10 @@ fw_up() {
                 done
                 ;;
             internet)
+                if [[ -n "${WG_DNS_LOCAL:-}" ]]; then
+                    iptables -A WG_FWD -s "${ip}/32" -d "$WG_DNS_LOCAL" -p udp --dport 53 -j ACCEPT
+                    iptables -A WG_FWD -s "${ip}/32" -d "$WG_DNS_LOCAL" -p tcp --dport 53 -j ACCEPT
+                fi
                 for net in $PRIV_NETS; do
                     iptables -A WG_FWD -s "${ip}/32" -d "$net" -j DROP
                 done
@@ -198,6 +244,9 @@ fw_down() {
     iptables -D INPUT -i "$IFACE" -j WG_IN 2>/dev/null || true
     iptables -D INPUT -i 'wx-+' -j WG_EXIN 2>/dev/null || true
     iptables -t nat -D POSTROUTING -s "$WG_NET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || true
+    iptables -t nat -D PREROUTING -i "$IFACE" -j WG_TOR 2>/dev/null || true
+    iptables -t nat -F WG_TOR 2>/dev/null || true
+    iptables -t nat -X WG_TOR 2>/dev/null || true
     while read -r name tid; do
         [[ -n "${name:-}" ]] || continue
         iptables -t nat -D POSTROUTING -s "$WG_NET" -o "wx-${name}" -j MASQUERADE 2>/dev/null || true
@@ -232,7 +281,7 @@ next_ip() {
 cmd_add() {
     local name="${1:-}" profile="${2:-}" xit="direct" client_pub="" priv pub psk ip srv_pub routes="" dns_line="" d
 
-    [[ $# -ge 2 ]] || die "usage : add <nom> <lan|backup|internet> [--exit <sortie>] [--pubkey <clé>]"
+    [[ $# -ge 2 ]] || die "usage : add <nom> <lan|backup|internet|tor> [--exit <sortie>] [--pubkey <clé>]"
     shift 2
 
     while (($#)); do
@@ -243,8 +292,9 @@ cmd_add() {
         esac
     done
 
-    [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "nom invalide (a-z, 0-9, - et _ ; 32 caractères max)"
-    case "$profile" in lan | backup | internet) ;; *) die "profil inconnu : '${profile}' (lan | backup | internet)" ;; esac
+    [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "nom invalide : « ${name} » (a-z minuscules, 0-9, - et _ ; 32 caractères max, sans espace ni point)"
+    case "$profile" in lan | backup | internet | tor) ;; *) die "profil inconnu : '${profile}' (lan | backup | internet | tor)" ;; esac
+    [[ "$profile" != "tor" || "$WG_TOR" == "true" ]] || die "profil tor indisponible : ENABLE_TOR=false (puis ./install.sh --run wg_tor_setup)"
     in_list "$PEERS" "$name" && die "le pair '${name}' existe déjà"
 
     if [[ "$xit" != "direct" ]]; then
@@ -281,6 +331,7 @@ cmd_add() {
         lan)
             routes="${WG_SERVER_IP}/32"
             for d in ${WG_LAN_ROUTES//,/ }; do routes+=", ${d}"; done
+            [[ -n "${WG_DNS_LOCAL:-}" ]] && dns_line="DNS = ${WG_DNS_LOCAL}"
             ;;
         backup)
             routes="${WG_SERVER_IP}/32"
@@ -289,6 +340,10 @@ cmd_add() {
         internet)
             routes="0.0.0.0/0, ::/0"
             dns_line="DNS = ${WG_DNS}"
+            ;;
+        tor)
+            routes="0.0.0.0/0, ::/0"
+            dns_line="DNS = ${WG_SERVER_IP}"      # résolu par Tor (UDP 53 redirigé vers le DNSPort)
             ;;
     esac
 
@@ -327,10 +382,15 @@ cmd_add_device() {
         while read -r en _; do
             [[ -n "${en:-}" ]] && targets+=("$en")
         done < "$EXITS"
+        [[ "$WG_TOR" == "true" ]] && targets+=(tor)
     fi
 
     for t in "${targets[@]}"; do
-        cmd_add "${dev}-${t}" internet --exit "$t"
+        if [[ "$t" == "tor" ]]; then
+            cmd_add "${dev}-tor" tor
+        else
+            cmd_add "${dev}-${t}" internet --exit "$t"
+        fi
     done
 }
 
@@ -483,19 +543,34 @@ cmd_exit_test() {
     done < "$EXITS"
 }
 
+cmd_tor_test() {
+    [[ "$WG_TOR" == "true" ]] || die "Tor désactivé (ENABLE_TOR=false)"
+    if systemctl is-active --quiet tor@default; then echo "Service Tor : actif"; else echo "Service Tor : ARRÊTÉ (journalctl -u tor@default)"; fi
+    journalctl -u tor@default --no-pager 2>/dev/null | grep -o 'Bootstrapped [0-9]*%.*' | tail -n 1 || true
+    echo "IP de sortie vue par check.torproject.org (via Tor) :"
+    curl -s --max-time 60 --socks5-hostname "127.0.0.1:${TOR_SOCKS}" https://check.torproject.org/api/ip \
+        || echo "échec : circuit Tor non établi (réseau du CT ? voir le journal ci-dessus)"
+    echo
+}
+
 cmd_status() {
     wg show
     echo
     cmd_list
     echo
     cmd_exit_list
+    if [[ "$WG_TOR" == "true" ]]; then
+        echo
+        printf 'Tor : %s\n' "$(systemctl is-active tor@default 2>/dev/null || true)"
+    fi
 }
 
 usage() {
     cat <<'EOF'
 wg-homelab <commande>
-  add <nom> <lan|backup|internet> [--exit <sortie>] [--pubkey <clé>]
-  add-device <appareil> [sortie...]    un pair internet par sortie (+ direct)
+  add <nom> <lan|backup|internet|tor> [--exit <sortie>] [--pubkey <clé>]
+  add-device <appareil> [sortie...]    un pair internet par sortie (+ direct, + tor si activé)
+  tor-test          Tor actif ? IP de sortie
   remove <nom>      show <nom>      list      set-exit <pair> <sortie|direct>
   exit-add <nom> <fichier.conf>   exit-remove <nom>   exit-list   exit-test
   status            fw-up           fw-down
@@ -514,6 +589,7 @@ case "${1:-}" in
     exit-list)   cmd_exit_list ;;
     exit-test)   cmd_exit_test ;;
     status)      cmd_status ;;
+    tor-test)    cmd_tor_test ;;
     fw-up)       fw_up ;;
     fw-down)     fw_down ;;
     *)           usage ;;
@@ -586,6 +662,66 @@ wg show wg0
 WGINSTALL
 }
 
+# Script exécuté DANS le CT : installe/configure le client Tor (idempotent) ou le désactive.
+wireguard_tor_script() {
+    cat <<'WGTOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+# shellcheck disable=SC1091
+source /etc/wireguard/homelab.env
+
+if [[ "${WG_TOR:-false}" != "true" ]]; then
+    if systemctl list-unit-files tor@default.service >/dev/null 2>&1; then
+        systemctl disable --now tor@default.service tor.service >/dev/null 2>&1 || true
+        echo "Tor désactivé dans le CT (les pairs du profil tor n'ont plus de sortie)."
+    fi
+    exit 0
+fi
+
+apt-get update -qq
+apt-get install -y --no-install-recommends tor curl ca-certificates
+
+# Client uniquement : jamais de relais ni de sortie. Les ports sont liés aux adresses du CT,
+# aucun n'est redirigé depuis l'extérieur.
+{
+    echo "# Géré par l'installateur homelab : ne pas modifier."
+    echo "ClientOnly 1"
+    echo "SocksPort 127.0.0.1:9050"
+    echo "TransPort ${WG_SERVER_IP}:9040"
+    echo "DNSPort ${WG_SERVER_IP}:5353"
+    echo "AutomapHostsOnResolve 1"
+    echo "VirtualAddrNetworkIPv4 10.192.0.0/10"
+    if [[ "${WG_TOR_SOCKS:-true}" == "true" ]]; then
+        echo "SocksPort ${WG_CT_IP}:9050"
+        echo "SocksPort ${WG_SERVER_IP}:9050"
+        echo "SocksPolicy accept 127.0.0.1"
+        echo "SocksPolicy accept ${WG_PRIVATE_NET}"
+        echo "SocksPolicy accept ${WG_NET}"
+        echo "SocksPolicy reject *"
+    fi
+} > /etc/tor/torrc
+
+# Tor attend l'adresse VPN du serveur : démarré après wg0, relancé avec lui.
+install -d /etc/systemd/system/tor@default.service.d
+cat > /etc/systemd/system/tor@default.service.d/wireguard.conf <<'DROPIN'
+[Unit]
+After=wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Restart=on-failure
+RestartSec=20
+DROPIN
+systemctl daemon-reload
+systemctl enable tor.service tor@default.service >/dev/null 2>&1 || true
+systemctl restart tor@default.service
+sleep 3
+systemctl is-active --quiet tor@default.service || { echo "ERREUR : Tor ne démarre pas (journalctl -u tor@default)" >&2; exit 1; }
+echo "Tor : client actif (TransPort ${WG_SERVER_IP}:9040, DNS :5353$([[ "${WG_TOR_SOCKS:-true}" == "true" ]] && echo ", SOCKS5 :9050"))."
+WGTOR
+}
+
 # Fichier d'environnement du CT (valeurs de l'hôte, sans aucun secret).
 wireguard_env_file() {
     cat <<EOF
@@ -594,10 +730,15 @@ WG_PORT="${WG_PORT}"
 WG_NET="${WG_NET}"
 WG_SERVER_IP="${WG_SERVER_IP}"
 WG_MTU="${WG_MTU}"
-WG_DNS="${WG_DNS}"
+WG_DNS="$(wg_dns_value)"
+WG_DNS_LOCAL="$([[ "${ENABLE_DNS:-false}" == "true" && "${DNS_FOR_WG:-true}" == "true" ]] && printf '%s' "${DNS_IP%%/*}")"
 WG_LAN_ROUTES="$(wg_lan_routes)"
 WG_BACKUP_DESTS="$(wg_backup_dests)"
 WG_BACKUP_PORTS="${WG_BACKUP_PORTS}"
+WG_TOR="${ENABLE_TOR:-false}"
+WG_TOR_SOCKS="${WG_TOR_SOCKS:-true}"
+WG_CT_IP="${WG_IP%%/*}"
+WG_PRIVATE_NET="${PRIVATE_NET}"
 EOF
 }
 
@@ -632,7 +773,21 @@ create_wireguard_ct() {
         warn "CT ${WG_ID} existe déjà : création ignorée, mise à jour du CLI et de l'environnement."
 
         pct start "$WG_ID" >/dev/null 2>&1 || true
+        pct_wait_for_network "$WG_ID"
         wg_push_files
+
+        # Installation précédente interrompue : WireGuard n'est pas dans le CT.
+        if ! pct exec "$WG_ID" -- test -f /etc/wireguard/wg0.conf; then
+            warn "WireGuard n'est pas installé dans le CT ${WG_ID} (installation précédente interrompue) : installation."
+            local SCRIPT
+            SCRIPT="$(mktemp)"
+            wireguard_install_script > "$SCRIPT"
+            pct_push_script "$WG_ID" "$SCRIPT" "/root/install-wireguard.sh"
+            pct exec "$WG_ID" -- bash /root/install-wireguard.sh \
+                || die "Échec de l'installation de WireGuard dans le CT ${WG_ID} (voir les messages ci-dessus)."
+            pct exec "$WG_ID" -- rm -f /root/install-wireguard.sh || true
+            rm -f "$SCRIPT"
+        fi
 
         return 0
     fi
@@ -650,7 +805,7 @@ create_wireguard_ct() {
         --cores "$WG_CORES" \
         --memory "$WG_MEMORY" \
         --swap 128 \
-        --rootfs "local-lvm:${WG_DISK%G}" \
+        --rootfs "${GUEST_STORAGE}:${WG_DISK%G}" \
         --net0 "name=eth0,bridge=${PRIVATE_BRIDGE},firewall=1,gw=${WG_GATEWAY},ip=${WG_IP}" \
         --unprivileged "$WG_UNPRIVILEGED" \
         --onboot 1
@@ -670,7 +825,7 @@ create_wireguard_ct() {
     pct exec "$WG_ID" -- bash /root/install-wireguard.sh \
         || die "Échec de l'installation de WireGuard dans le CT ${WG_ID} (voir les messages ci-dessus)."
 
-    pct exec "$WG_ID" -- rm -f /root/install-wireguard.sh
+    pct exec "$WG_ID" -- rm -f /root/install-wireguard.sh || true
     rm -f "$SCRIPT"
 
     info "WireGuard installé dans le CT ${WG_ID}."
@@ -683,8 +838,27 @@ wg_create_default_peers() {
 
     for entry in $WG_PEERS; do
 
+        if [[ "$entry" != *:* ]]; then
+            warn "WG_PEERS : « ${entry} » ignoré (format attendu nom:profil, ex. pc:lan ; profils : lan | backup | internet | tor)."
+            continue
+        fi
+
         name="${entry%%:*}"
         profile="${entry#*:}"
+
+        # Le nom d'un pair : a-z, 0-9, - et _ (32 max) ; on normalise (majuscules, accents, espaces, points...)
+        local clean
+        clean="$(printf '%s' "$name" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf '%s' "$name")"
+        clean="$(printf '%s' "${clean,,}" | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/-+$//' | cut -c1-32)"
+        [[ -n "$clean" ]] || { warn "WG_PEERS : nom « ${name} » inutilisable, entrée ignorée."; continue; }
+        if [[ "$clean" != "$name" ]]; then
+            info "WireGuard : pair « ${name} » renommé « ${clean} » (caractères autorisés : a-z, 0-9, - et _)."
+            name="$clean"
+        fi
+        case "$profile" in
+            lan | backup | internet | tor) ;;
+            *) warn "WG_PEERS : profil « ${profile} » inconnu pour « ${name} » (lan | backup | internet | tor) : entrée ignorée."; continue ;;
+        esac
 
         if pct exec "$WG_ID" -- grep -q "^${name} " /etc/wireguard/peers.list; then
             info "WireGuard : pair '${name}' déjà présent."
@@ -710,10 +884,35 @@ verify_wireguard() {
     info "WireGuard : n'oublie pas la redirection UDP ${WG_PORT} -> ${LAN_IP} sur ta box."
 }
 
+# Installe (ou désactive) le client Tor dans le CT, puis réapplique le pare-feu. Relançable sans risque :
+# ./install.sh --run wg_tor_setup
+wg_tor_setup() {
+
+    local tmp
+    wg_push_files
+
+    tmp="$(mktemp)"
+    wireguard_tor_script > "$tmp"
+    pct_push_script "$WG_ID" "$tmp" "/root/install-tor.sh"
+    rm -f "$tmp"
+
+    if pct exec "$WG_ID" -- bash /root/install-tor.sh; then
+        if [[ "${ENABLE_TOR:-false}" == "true" ]]; then
+            info "Tor : client installé dans le CT ${WG_ID} (profil tor : ./install.sh --run wg_add_peer <nom> tor ; test : ./install.sh --run wg_test_tor)."
+        fi
+    else
+        warn "Tor : l'installation dans le CT ${WG_ID} a échoué (voir les messages ci-dessus) ; le profil tor reste inutilisable."
+    fi
+
+    pct exec "$WG_ID" -- rm -f /root/install-tor.sh || true
+    pct exec "$WG_ID" -- "$WG_CLI" fw-up || warn "WireGuard : fw-up échoué (WireGuard installé dans le CT ?)."
+}
+
 deploy_wireguard() {
 
     configure_wireguard_host
     create_wireguard_ct
+    wg_tor_setup
     wg_create_default_peers
     verify_wireguard
 }
@@ -731,6 +930,7 @@ wg_set_exit()    { pct exec "$WG_ID" -- "$WG_CLI" set-exit "$@"; }
 wg_list_exits()  { pct exec "$WG_ID" -- "$WG_CLI" exit-list; }
 wg_test_exits()  { pct exec "$WG_ID" -- "$WG_CLI" exit-test; }
 wg_status()      { pct exec "$WG_ID" -- "$WG_CLI" status; }
+wg_test_tor()    { pct exec "$WG_ID" -- "$WG_CLI" tor-test; }
 
 # Importe une configuration WireGuard de fournisseur VPN comme sortie.
 # Usage : wg_add_exit <nom> </chemin/fichier.conf>

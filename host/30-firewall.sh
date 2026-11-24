@@ -161,6 +161,49 @@ configure_web_port_forwards() {
         fi
     fi
 
+    if [[ "$ENABLE_MAIL" == "true" ]]; then
+        local mail_port
+        for mail_port in 25 465 587 993; do
+            add_dnat_forward "$mail_port" "${MAIL_IP%%/*}" "$mail_port"
+        done
+    fi
+
+    if [[ "$ENABLE_MONITOR" == "true" ]]; then
+        [[ "$MONITOR_KUMA" == "true" ]] && add_dnat_forward "$KUMA_PORT" "${MONITOR_IP%%/*}" 3001
+        [[ "$MONITOR_NTFY" == "true" ]] && add_dnat_forward "$NTFY_PORT" "${MONITOR_IP%%/*}" 80
+        [[ "$MONITOR_HOMEPAGE" == "true" ]] && add_dnat_forward "$HOMEPAGE_PORT" "${MONITOR_IP%%/*}" 3000
+    fi
+
+    if [[ "$ENABLE_ARR" == "true" && "$ENABLE_DOCKER" == "true" ]]; then
+        # Interfaces d'administration : LAN uniquement (ne pas rediriger ces ports depuis la box).
+        add_dnat_forward "$SONARR_PORT" "${DOCKER_IP%%/*}" "$SONARR_PORT"
+        add_dnat_forward "$RADARR_PORT" "${DOCKER_IP%%/*}" "$RADARR_PORT"
+        add_dnat_forward "$PROWLARR_PORT" "${DOCKER_IP%%/*}" "$PROWLARR_PORT"
+        add_dnat_forward "$QBIT_PORT" "${DOCKER_IP%%/*}" "$QBIT_PORT"
+    fi
+
+    if [[ "$ENABLE_DNS" == "true" ]]; then
+        # Réservé au LAN : la règle ne vise que l'IP LAN de l'hôte, et AdGuard Home
+        # refuse tout client hors LAN/réseau privé/VPN. Ne PAS rediriger 53 depuis la box.
+        if [[ "$DNS_FORWARD_LAN" == "true" ]]; then
+            add_dnat_forward 53 "${DNS_IP%%/*}" 53 udp
+            add_dnat_forward 53 "${DNS_IP%%/*}" 53 tcp
+        fi
+        if [[ -n "$DNS_UI_PORT" ]]; then
+            add_dnat_forward "$DNS_UI_PORT" "${DNS_IP%%/*}" 80
+        fi
+    fi
+
+    if [[ "$ENABLE_AI" == "true" ]]; then
+        # Interface Open WebUI et API Ollama : LAN uniquement (ne pas rediriger ces ports depuis la box).
+        add_dnat_forward "$AI_WEB_PORT" "${AI_IP%%/*}" "$AI_WEB_PORT"
+        [[ "$AI_API_LAN" == "true" ]] && add_dnat_forward "$AI_API_PORT" "${AI_IP%%/*}" "$AI_API_PORT"
+    fi
+
+    if [[ "$ENABLE_NODE" == "true" ]]; then
+        add_dnat_forward "$NODE_HTTP_PORT" "${NODE_IP%%/*}" "$NODE_HTTP_PORT"
+    fi
+
     if [[ "$ENABLE_FILES" == "true" ]]; then
         add_dnat_forward 10000 "${FILES_IP%%/*}" 10000
     fi

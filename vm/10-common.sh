@@ -2,18 +2,41 @@
 #                              CLOUD IMAGE                                    #
 ###############################################################################
 
+# VM du script qui n'existent pas encore (donc qui ont besoin de l'image cloud).
+vm_image_needed() {
+    local pair en id
+    for pair in "ENABLE_FILES:${FILES_ID}" "ENABLE_DOCKER:${DOCKER_ID}"; do
+        en="${pair%%:*}"; id="${pair##*:}"
+        [[ "${!en:-false}" == "true" ]] || continue
+        qm status "$id" >/dev/null 2>&1 || return 0
+    done
+    return 1
+}
+
 download_debian_image() {
 
     mkdir -p "$DEBIAN_IMAGE_DIR"
 
-    if [[ ! -f "$DEBIAN_IMAGE" ]]; then
+    # Image déjà stockée : aucune écriture. Image absente et aucune VM à créer : rien à télécharger.
+    if [[ ! -s "$DEBIAN_IMAGE" ]] && ! vm_image_needed; then
+        info "Image cloud Debian : aucune VM à créer, téléchargement inutile."
+        return 0
+    fi
 
-        info "Téléchargement de Debian 13 cloud image..."
+    if [[ -s "$DEBIAN_IMAGE" ]]; then
+        info "Image cloud Debian déjà stockée ($(du -h "$DEBIAN_IMAGE" | cut -f1)) : pas de téléchargement."
+    else
 
+        info "Téléchargement de Debian 13 cloud image (stockée dans ${DEBIAN_IMAGE_DIR})..."
+
+        # Fichier temporaire puis renommage : un téléchargement interrompu ne laisse jamais une image tronquée en place.
         wget \
             --https-only \
-            -O "$DEBIAN_IMAGE" \
-            "$DEBIAN_IMAGE_URL"
+            -c \
+            -O "${DEBIAN_IMAGE}.part" \
+            "$DEBIAN_IMAGE_URL" \
+            || die "Téléchargement de l'image Debian échoué (relancer reprend où il s'est arrêté)."
+        mv -f "${DEBIAN_IMAGE}.part" "$DEBIAN_IMAGE"
     fi
 
     [[ -s "$DEBIAN_IMAGE" ]] \
@@ -24,6 +47,33 @@ download_debian_image() {
 
     qemu-img info "$DEBIAN_IMAGE" >/dev/null \
         || die "L'image Debian n'est pas une image QEMU valide."
+}
+
+# Images stockées : état et nettoyage. ./install.sh --run images_status | images_purge
+images_status() {
+    echo "Images stockées dans ${IMAGE_STORE_DIR} (stockage ${TEMPLATE_STORAGE}, STORE_IMAGES=${STORE_IMAGES}) :"
+    ls -lh "$IMAGE_STORE_DIR" 2>/dev/null | awk 'NR>1 && $NF ~ /\.(qcow2|run|iso)$/ {printf "  %-45s %s\n", $NF, $5}'
+    echo "Templates des CT (pveam) :"
+    pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk 'NR>1 {printf "  %-60s %s\n", $1, $2}'
+    echo "Espace libre sur ${TEMPLATE_STORAGE} : $(df -h "$IMAGE_STORE_DIR" | awk 'NR==2 {print $4}')"
+}
+
+# Supprime les images stockées (elles seront retéléchargées à la prochaine création de VM/CT).
+images_purge() {
+    local f t
+    for f in "$DEBIAN_IMAGE" "${DEBIAN_IMAGE}.part" "$IMAGE_STORE_DIR"/NVIDIA-Linux-x86_64-*.run; do
+        [[ -e "$f" ]] && { info "Suppression de ${f}"; rm -f "$f"; }
+    done
+    pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk '$1 ~ /vztmpl\/debian-13-standard/ {print $1}' | while read -r t; do
+        info "Suppression du template ${t}"; pveam remove "$t" >/dev/null 2>&1 || true
+    done
+}
+
+# Fin d'installation : si STORE_IMAGES=false, libère l'espace.
+images_cleanup() {
+    [[ "$STORE_IMAGES" == "false" ]] || return 0
+    info "STORE_IMAGES=false : suppression des images téléchargées."
+    images_purge
 }
 
 ###############################################################################
@@ -72,7 +122,7 @@ wait_for_qemu_agent() {
 
         elapsed=$(( attempt * 5 ))
 
-        info "[${elapsed}s] Agent QEMU pas encore prêt sur la VM ${VMID} (tentative ${attempt}/${MAX_ATTEMPTS}). Erreur : ${last_error}"
+        info "[${elapsed}s] Agent QEMU pas encore remonté sur la VM ${VMID} (tentative ${attempt}/${MAX_ATTEMPTS}), normal pendant le démarrage. Réponse : ${last_error}"
 
         sleep 5
     done
@@ -131,7 +181,17 @@ wait_for_cloud_init() {
 
         if grep -q 'status: error' <<< "$status_line"; then
             warn "cloud-init signale une erreur sur la VM ${VMID} : ${status_line}"
-            warn "Consulte /var/log/cloud-init.log et /var/log/cloud-init-output.log depuis la console de la VM."
+            # Affiche directement la cause (fin du journal + détail des erreurs) au lieu de renvoyer à la console.
+            local err_tail
+            err_tail="$(
+                qm guest exec "$VMID" --timeout 60 -- bash -c 'cloud-init status --long 2>&1 | head -n 20; echo "--- fin de cloud-init-output.log :"; tail -n 40 /var/log/cloud-init-output.log 2>&1' 2>&1 |
+                    jq -r '.["out-data"] // empty, .["err-data"] // empty' 2>/dev/null || true
+            )"
+            if [[ -n "$err_tail" ]]; then
+                warn "Détail de l'erreur cloud-init (VM ${VMID}) :"
+                printf '%s\n' "$err_tail" >&2
+            fi
+            warn "Journaux complets : /var/log/cloud-init.log et /var/log/cloud-init-output.log dans la VM (qm guest exec ${VMID} -- tail -n 100 /var/log/cloud-init-output.log)."
             return 1
         fi
 
@@ -203,7 +263,7 @@ create_cloud_vm() {
         --scsihw virtio-scsi-single \
         --cores "$CORES" \
         --memory "$MEMORY" \
-        --cpu x86-64-v2-AES \
+        --cpu "${VM_CPU_TYPE:-x86-64-v2-AES}" \
         --net0 "virtio,bridge=${PRIVATE_BRIDGE},firewall=1" \
         --agent enabled=1 \
         --rng0 "source=/dev/urandom,max_bytes=1024,period=1000" \
@@ -221,15 +281,15 @@ create_cloud_vm() {
         --vga serial0
 
     qm set "$VMID" \
-        --efidisk0 "local-lvm:4,efitype=4m,pre-enrolled-keys=1"
+        --efidisk0 "${GUEST_STORAGE}:4,efitype=4m,pre-enrolled-keys=1"
 
     qm set "$VMID" \
-        --ide2 "local-lvm:cloudinit"
+        --ide2 "${GUEST_STORAGE}:cloudinit"
 
     qm importdisk \
         "$VMID" \
         "$DEBIAN_IMAGE" \
-        local-lvm \
+        "$GUEST_STORAGE" \
         --format qcow2
 
     local IMPORTED_DISK
@@ -262,7 +322,18 @@ create_cloud_vm() {
     if [[ "$CURRENT_SIZE_BYTES" != "$TARGET_SIZE_BYTES" ]]; then
 
         qm resize "$VMID" scsi0 "$DISK_SIZE" \
-            || warn "Redimensionnement du disque scsi0 ignoré (déjà à la bonne taille ou supérieure)."
+            || warn "Redimensionnement du disque scsi0 de la VM ${VMID} : échec (voir ci-dessous)."
+    fi
+
+    # Vérification : une VM dont le disque n'a pas la taille voulue (3 Go d'image) ne pourra pas installer ses paquets.
+    local NEW_SIZE
+    NEW_SIZE="$(
+        qm config "$VMID" |
+            awk -F'size=' '/^scsi0:/ {print $2}' |
+            awk -F',' '{print $1}'
+    )"
+    if [[ "$NEW_SIZE" != "$DISK_SIZE" ]]; then
+        die "VM ${VMID} : le disque scsi0 fait ${NEW_SIZE:-?} au lieu de ${DISK_SIZE} (redimensionnement refusé ou expiré). Vérifie l'espace libre du storage ${GUEST_STORAGE} (df -h) et, pour un storage dir : pvesm set ${GUEST_STORAGE} --preallocation off ; puis détruis la VM (qm destroy ${VMID} --purge) et relance."
     fi
 
     qm set "$VMID" \

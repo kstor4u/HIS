@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Reconstruit le script monolithique depuis les modules : ./build.sh > proxmox-homelab-install.sh
+# build.sh : assemble les modules (ordre du MANIFEST) en un script unique sur la sortie standard.
+#   ./build.sh > proxmox-homelab-install-vX.Y.Z.sh && chmod +x proxmox-homelab-install-vX.Y.Z.sh
 set -euo pipefail
-d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-first=1
-while IFS= read -r m; do
-    [[ -z "$m" ]] && continue
-    cat "$d/$m"
-done < "$d/MANIFEST"
+cd "$(dirname "${BASH_SOURCE[0]}")"
+while IFS= read -r mod; do
+    [[ -z "$mod" || "$mod" == \#* ]] && continue
+    cat "$mod"
+done < MANIFEST

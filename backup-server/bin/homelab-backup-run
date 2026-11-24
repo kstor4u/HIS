@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# Sauvegarde hebdomadaire par TIRAGE ("pull") : ce serveur va chercher les données
+# sur les serveurs Proxmox (lecture seule), contrôle le volume de changements,
+# crée un instantané, envoie un compte rendu, puis s'éteint jusqu'au prochain réveil.
+set -Eeuo pipefail
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf
+
+FORCE=0 NO_POWEROFF=0 ONLY="" RSYNC_EXTRA="" RUN_CHECK=0
+while (( $# )); do
+    case "$1" in
+        --force) FORCE=1; NO_POWEROFF=1 ;;           # exécution manuelle : pas de contrôle de réveil, pas d'extinction
+        --no-poweroff) NO_POWEROFF=1 ;;
+        --only) ONLY="${2:?nom de source manquant}"; shift ;;
+        --checksum) RSYNC_EXTRA="--checksum" ;;      # réparation : compare le CONTENU (lent)
+        --check) RUN_CHECK=1 ;;
+        *) echo "option inconnue : $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+exec 9>/run/homelab-backup-pull.lock
+flock -n 9 || { log "Une sauvegarde est déjà en cours."; exit 0; }
+
+REPORT=""
+ALERTS=0
+FAILS=0
+add() { REPORT+="$*"$'\n'; }
+
+# --- Démarrage automatique ou manuel ? -----------------------------------------
+if (( ! FORCE )); then
+    nw="$(cat "$HB_STATE/next-wake" 2>/dev/null || echo 0)"
+    delta=$(( $(date +%s) - nw )); delta=${delta#-}
+    if (( nw == 0 || delta > WAKE_TOLERANCE_MIN * 60 )); then
+        log "Démarrage non planifié (réveil prévu : $( [[ $nw -gt 0 ]] && date -d "@$nw" '+%F %T' || echo 'jamais armé'))."
+        log "Aucune sauvegarde lancée, pas d'extinction automatique. Lance 'homelab-backup-ctl run' pour sauvegarder."
+        hb_notify backup "Démarrage hors planning" "Aucune sauvegarde lancée et pas d'extinction automatique (réveil prévu : $( [[ $nw -gt 0 ]] && date -d "@$nw" '+%F %T' || echo 'jamais armé'))."
+        exit 0
+    fi
+fi
+
+START=$SECONDS
+log "=== Début de la sauvegarde ==="
+hb_notify backup "Sauvegarde démarrée" "Sources : $(hb_source_names | tr '\n' ' ')"
+
+mountpoint -q "${BACKUP_MOUNT:-$BACKUP_ROOT}" || {
+    hb_mail "[Sauvegarde] ERREUR : volume de sauvegarde non monté" \
+        "$BACKUP_ROOT n'est pas monté (RAID dégradé ou absent ?). Aucune sauvegarde effectuée."
+    FAILS=1
+}
+
+# --- Un serveur source -------------------------------------------------------------
+# Compte les fichiers transférés/supprimés par rsync, compare au volume total connu
+# (dernier état VALIDÉ), nomme l'instantané ".SUSPECT" au-delà du seuil.
+pull_source_inner() {
+    local name="$1"
+    local HOST="" USER="" PORT="" PATHS="" SSH_KEY="" THRESHOLD="" EXCLUDES="" CANARIES="" WG_CONF=""
+    hb_source_load "$name" || { add "[$name] ÉCHEC : configuration de la source invalide : ${HB_SRC_ERR}."; return 1; }
+    THRESHOLD="${THRESHOLD:-$CHANGE_THRESHOLD}"
+
+    local base="$BACKUP_ROOT/$name" mirror snaps
+    mirror="$base/mirror"; snaps="$base/snaps"
+    mkdir -p "$mirror" "$snaps"
+
+    local ssh_cmd="ssh -i $SSH_KEY -p $PORT -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+
+    # Attente de joignabilité du port SSH (le serveur source peut être lent : 5 min max)
+    local t=0
+    until timeout 10 bash -c "exec 3<>/dev/tcp/$HOST/$PORT" 2>/dev/null; do
+        if (( t >= 10 )); then add "[$name] ÉCHEC : $HOST:$PORT injoignable."; return 1; fi
+        t=$(( t + 1 )); sleep 30
+    done
+
+    local transferred=0 deleted=0 total=0 p out rc
+    local -a ex=() exl=()
+    local e; read -ra exl <<< "$EXCLUDES"; for e in "${exl[@]}"; do ex+=(--exclude "$e"); done
+
+    for p in $PATHS; do
+        mkdir -p "$mirror/$p"
+        set +e
+        out="$(rsync -aHAX --numeric-ids --delete --stats --no-human-readable $RSYNC_EXTRA "${ex[@]}" \
+                -e "$ssh_cmd" "$USER@$HOST:$p/" "$mirror/$p/" 2>&1)"
+        rc=$?
+        set -e
+        echo "$out" >> "$HB_LOG"
+        if (( rc != 0 && rc != 24 )); then          # 24 = fichiers disparus pendant la copie : normal
+            add "[$name] ÉCHEC rsync ($p) code $rc : $(echo "$out" | tail -n 3 | tr '\n' ' ')"
+            return 1
+        fi
+        local tr de to
+        tr="$(grep -E '^Number of regular files transferred:' <<<"$out" | tr -dc '0-9' || true)"
+        de="$(grep -E '^Number of deleted files:' <<<"$out" | tr -dc '0-9' || true)"
+        to="$(grep -E '^Number of files:' <<<"$out" | sed -E 's/.*reg: ([0-9]+).*/\1/; t; s/^Number of files: ([0-9]+).*/\1/' || true)"
+        transferred=$(( transferred + ${tr:-0} ))
+        deleted=$(( deleted + ${de:-0} ))
+        total=$(( total + ${to:-0} ))
+    done
+
+    local changed=$(( transferred + deleted ))
+    local baseline_file="$HB_STATE/$name.baseline" alert_file="$HB_STATE/$name.alert"
+    local baseline=0 pct="0.0" suspect=0 reason=""
+    [[ -f "$baseline_file" ]] && baseline="$(cat "$baseline_file")"
+
+    if (( baseline > 0 )); then
+        pct="$(awk -v c="$changed" -v b="$baseline" 'BEGIN{printf "%.1f", c*100/b}')"
+        if awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{exit !(p>t)}'; then
+            suspect=1
+            reason="${pct}% de fichiers modifiés ou supprimés (seuil ${THRESHOLD}%)"
+        fi
+    fi
+    # Fichiers témoins : ils ne doivent JAMAIS changer (empreinte mémorisée à la première vue).
+    local cf="$HB_STATE/$name.canaries" c h known cmsg=""
+    touch "$cf"
+    for c in $CANARIES; do
+        if [[ -f "$mirror/$c" ]]; then h="$(sha256sum "$mirror/$c" | cut -d' ' -f1)"; else h="ABSENT"; fi
+        known="$(awk -v f="$c" '$1==f{print $2}' "$cf")"
+        if [[ -z "$known" ]]; then
+            [[ "$h" == "ABSENT" ]] || echo "$c $h" >> "$cf"
+            [[ "$h" == "ABSENT" ]] && cmsg+="témoin introuvable dès le départ : $c ; "
+        elif [[ "$h" != "$known" ]]; then
+            [[ "$h" == "ABSENT" ]] && cmsg+="témoin SUPPRIMÉ : $c ; " || cmsg+="témoin MODIFIÉ : $c ; "
+        fi
+    done
+    if [[ -n "$cmsg" ]]; then
+        suspect=1
+        reason="${reason:+$reason ; }${cmsg%; }"
+    fi
+    if (( ! suspect )) && [[ -f "$alert_file" ]]; then
+        suspect=1
+        reason="une alerte précédente n'a pas été acquittée"
+    fi
+
+    local stamp snapname
+    stamp="$(date +%F)"
+    snapname="$stamp"
+    [[ -e "$snaps/$snapname" || -e "$snaps/$snapname.SUSPECT" ]] && snapname="$(date +%F_%H%M%S)"
+
+    rm -rf "$snaps/.tmp-$snapname"
+    cp -al --preserve=all "$mirror" "$snaps/.tmp-$snapname"
+
+    if (( suspect )); then
+        mv "$snaps/.tmp-$snapname" "$snaps/$snapname.SUSPECT"
+        [[ -f "$alert_file" ]] || echo "$(date -Is) $reason" > "$alert_file"
+        add "[$name] ⚠ ALERTE : $reason. Instantané $snapname.SUSPECT conservé à part (référence inchangée : $baseline fichiers)."
+        ALERTS=$(( ALERTS + 1 ))
+    else
+        mv "$snaps/.tmp-$snapname" "$snaps/$snapname"
+        echo "$total" > "$baseline_file"
+        if (( baseline == 0 )); then
+            add "[$name] première sauvegarde enregistrée comme référence : $total fichiers, instantané $snapname."
+        else
+            add "[$name] OK : $total fichiers, $changed modifiés/supprimés (${pct}%), instantané $snapname."
+        fi
+        prune_snapshots "$name"
+    fi
+}
+
+# Tunnel WireGuard facultatif (WG_CONF dans la source) : monté juste pour cette source puis coupé,
+# ce qui évite aussi les conflits d'adresses entre serveurs ayant le même réseau privé.
+pull_source() {
+    local name="$1" wgc="" iface rc=0 t=0
+    local HOST="" USER="" PORT="" PATHS="" SSH_KEY="" THRESHOLD="" EXCLUDES="" CANARIES="" WG_CONF=""
+    hb_source_load "$name" || { add "[$name] ÉCHEC : configuration de la source invalide : ${HB_SRC_ERR}."; return 1; }
+    wgc="$WG_CONF"
+
+    if [[ -z "$wgc" ]]; then pull_source_inner "$name"; return; fi
+
+    iface="$(basename "$wgc" .conf)"
+    wg-quick down "$iface" >/dev/null 2>&1 || true
+    if ! wg-quick up "$wgc" >>"$HB_LOG" 2>&1; then
+        add "[$name] ÉCHEC : le tunnel WireGuard '$wgc' ne démarre pas."
+        return 1
+    fi
+    # Attente de la poignée de main (60 s max)
+    until [[ "$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}' | head -n1)" -gt 0 ]] 2>/dev/null; do
+        if (( t >= 30 )); then
+            add "[$name] ÉCHEC : pas de réponse du serveur WireGuard (box : UDP redirigé ? IP publique à jour ?)."
+            wg-quick down "$iface" >>"$HB_LOG" 2>&1 || true
+            return 1
+        fi
+        t=$(( t + 1 )); sleep 2
+    done
+    pull_source_inner "$name" || rc=$?
+    wg-quick down "$iface" >>"$HB_LOG" 2>&1 || true
+    return $rc
+}
+
+# Rotation : on garde les KEEP_LAST derniers valides + le plus ancien de chaque mois (KEEP_MONTHLY mois).
+# Rien n'est supprimé tant qu'une alerte n'est pas acquittée.
+prune_snapshots() {
+    local name="$1" s m
+    [[ -f "$HB_STATE/$name.alert" ]] && return 0
+    local -a all keep=()
+    mapfile -t all < <(hb_snap_valid_list "$name")
+    local n=${#all[@]}
+    (( n > KEEP_LAST )) || return 0
+
+    local i
+    for (( i = n - KEEP_LAST; i < n; i++ )); do keep+=("${all[i]}"); done
+
+    declare -A seen=()
+    for s in "${all[@]}"; do
+        m="${s:0:7}"
+        [[ -n "${seen[$m]:-}" ]] && continue
+        seen[$m]="$s"
+    done
+    local months; months="$(printf '%s\n' "${!seen[@]}" | sort | tail -n "$KEEP_MONTHLY")"
+    for m in $months; do keep+=("${seen[$m]}"); done
+
+    for s in "${all[@]}"; do
+        if ! printf '%s\n' "${keep[@]}" | grep -qx "$s"; then
+            rm -rf "${BACKUP_ROOT:?}/$name/snaps/$s"
+            log "[$name] ancien instantané supprimé : $s"
+        fi
+    done
+}
+
+# --- Exécution --------------------------------------------------------------------
+if (( FAILS == 0 )); then
+    if [[ -n "$ONLY" ]]; then SRC=("$ONLY"); [[ -f "$HB_ETC/sources.d/$ONLY.json" ]] || { echo "Source inconnue : $ONLY" >&2; exit 2; }
+    else mapfile -t SRC < <(hb_source_names); fi
+    (( ${#SRC[@]} > 0 )) || { add "Aucune source dans $HB_ETC/sources.d/"; FAILS=1; }
+    for s in "${SRC[@]}"; do
+        # Durée maximale globale
+        if (( SECONDS - START > MAX_RUNTIME_H * 3600 )); then
+            add "[$s] ignoré : durée maximale (${MAX_RUNTIME_H} h) dépassée."; FAILS=$(( FAILS + 1 )); continue
+        fi
+        hb_notify backup "Source ${s} : début" "Copie depuis ${s} en cours."
+        seg=${#REPORT}
+        if pull_source "$s"; then
+            hb_notify backup "Source ${s} : terminée" "${REPORT:seg}"
+        else
+            FAILS=$(( FAILS + 1 ))
+            hb_notify alert "Source ${s} : ÉCHEC" "${REPORT:seg}"
+        fi
+    done
+fi
+
+# --- Contrôle périodique (RAID + intégrité) -------------------------------------------------------
+check_due() {
+    [[ "$CHECK_MONTHLY" == "true" ]] || return 1
+    (( RUN_CHECK )) && return 0
+    (( FORCE )) && return 1
+    [[ -f "$HB_STATE/check.last" ]] || return 0                              # jamais fait : référence initiale
+    compgen -G "$HB_STATE/*.verify-pending" >/dev/null && return 0           # parcours à terminer
+    [[ -f "$HB_STATE/scrub-md.pos" ]] && return 0                            # vérification RAID à terminer
+    (( $(date +%s) - $(cat "$HB_STATE/check.last") >= CHECK_INTERVAL_DAYS * 86400 ))
+}
+if (( FAILS == 0 )) && [[ -z "$ONLY" ]] && check_due; then
+    add ""
+    set +e
+    CHECK_OUT="$("${HB_CHECK:-/usr/local/sbin/homelab-backup-check}" 2>&1)"; CHECK_RC=$?
+    set -e
+    add "$CHECK_OUT"
+    (( CHECK_RC == 1 )) && ALERTS=$(( ALERTS + 1 ))
+    (( CHECK_RC == 2 )) && add "ℹ Contrôle incomplet : il reprendra au prochain démarrage."
+fi
+
+# --- Test de restauration (échantillon, dumps de bases, archives vzdump) --------------------------
+if (( FAILS == 0 )) && [[ -z "$ONLY" ]] && [[ "${RESTORE_TEST:-true}" == "true" ]]; then
+    add ""
+    set +e
+    RT_OUT="$("${HB_RESTORETEST:-/usr/local/sbin/homelab-backup-restoretest}" 2>&1)"; RT_RC=$?
+    set -e
+    add "$RT_OUT"
+    (( RT_RC != 0 )) && { ALERTS=$(( ALERTS + 1 )); add "⚠ Test de restauration : des sauvegardes ne sont PAS récupérables, voir ci-dessus."; }
+fi
+
+# --- État des disques ---------------------------------------------------------------
+add ""
+add "Espace : $(df -h --output=avail,pcent "$BACKUP_ROOT" 2>/dev/null | tail -n1 | xargs) (disponible, utilisé)"
+if command -v smartctl >/dev/null 2>&1; then
+    while read -r dev _; do
+        [[ -n "$dev" ]] || continue
+        h="$(smartctl -H "$dev" 2>/dev/null | grep -iE 'overall-health|SMART Health' | sed 's/.*: *//' || true)"
+        add "SMART $dev : ${h:-inconnu}"
+        [[ "$h" =~ PASSED|OK ]] || [[ -z "$h" ]] || { ALERTS=$(( ALERTS + 1 )); }
+    done < <(smartctl --scan 2>/dev/null)
+fi
+[[ -r /proc/mdstat ]] && grep -qE '\[[U_]*_[U_]*\]' /proc/mdstat && { add "⚠ RAID dégradé (voir /proc/mdstat)"; ALERTS=$(( ALERTS + 1 )); }
+
+DUR=$(( (SECONDS - START) / 60 ))
+add "Durée : ${DUR} min."
+
+# --- Compte rendu ---------------------------------------------------------------------
+if (( FAILS > 0 )); then
+    hb_mail "[Sauvegarde] ÉCHEC ($FAILS erreur(s))" "$REPORT"
+elif (( ALERTS > 0 )); then
+    hb_mail "[Sauvegarde] ALERTE : vérification nécessaire" \
+"$REPORT
+Pour examiner : homelab-backup-ctl status
+Si les changements sont normaux : homelab-backup-ctl ack <cluster>
+Sinon : homelab-backup-ctl ack <cluster> --discard   (supprime les instantanés suspects)"
+elif [[ "$REPORT_ALWAYS" == "true" ]]; then
+    hb_mail "[Sauvegarde] OK" "$REPORT"
+fi
+if (( FAILS > 0 )); then hb_notify alert "Sauvegarde : ÉCHEC (${FAILS} erreur(s))" "$REPORT"
+elif (( ALERTS > 0 )); then hb_notify alert "Sauvegarde : ALERTE, vérification nécessaire" "$REPORT"
+else hb_notify backup "Sauvegarde terminée : OK" "$REPORT"; fi
+log "$REPORT"
+log "=== Fin de la sauvegarde (échecs: $FAILS, alertes: $ALERTS) ==="
+
+if (( FAILS == 0 )) && [[ -n "$HEARTBEAT_URL" ]]; then
+    curl -fsS -m 20 "$HEARTBEAT_URL" >/dev/null 2>&1 || log "Heartbeat : appel échoué."
+fi
+
+# --- Extinction + prochain réveil --------------------------------------------------------
+if [[ "$POWER_OFF" == "true" ]] && (( ! NO_POWEROFF )); then
+    next="$(hb_next_wake_epoch)"
+    echo "$next" > "$HB_STATE/next-wake"
+    if [[ -e "$HB_STATE/keep-on" ]]; then
+        log "Extinction annulée : drapeau keep-on présent (homelab-backup-ctl keep-off pour le retirer)."
+    elif [[ -n "$(who 2>/dev/null)" ]]; then
+        log "Extinction annulée : une session est ouverte. Réveil prévu : $(date -d "@$next" '+%F %T')."
+    elif ! flock -n 8 8>/run/homelab-backup-export.lock; then
+        log "Extinction annulée : un export vers disque externe est en cours."
+    else
+        log "Extinction. Prochain réveil : $(date -d "@$next" '+%F %T')."
+        hb_notify backup "Extinction" "Prochain réveil : $(date -d "@$next" '+%F %T')."
+        sync
+        rtcwake -m off -t "$next" || { log "rtcwake a échoué : extinction simple (PAS de réveil programmé !)"; hb_mail "[Sauvegarde] rtcwake a échoué" "Le serveur s'éteint sans réveil programmé : règle l'alarme dans le BIOS."; systemctl poweroff; }
+    fi
+fi

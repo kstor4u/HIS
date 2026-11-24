@@ -28,6 +28,7 @@ warn() {
 
 die() {
     log "ERROR: $*"
+    declare -F secrets_persist >/dev/null 2>&1 && secrets_persist || true
     exit 1
 }
 
@@ -68,6 +69,6 @@ check_proxmox() {
 
     pvesh get "/nodes/${NODE_NAME}/status" \
         --output-format json >/dev/null \
-        || die "Le nœud Proxmox ${NODE_NAME} n'est pas accessible via l'API."
+        || die "Le nœud Proxmox ${NODE_NAME} n'est pas accessible via l'API (si tu viens de changer HOST_NAME : redémarre d'abord le serveur)."
 }
 

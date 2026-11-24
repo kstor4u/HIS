@@ -16,8 +16,17 @@ configure_variables() {
     echo "  FILES  = ${ENABLE_FILES}"
     echo "  XMRIG  = ${ENABLE_XMRIG}"
     echo "  WG     = ${ENABLE_WIREGUARD}"
+    echo "  NODE   = ${ENABLE_NODE}"
+    echo "  MAIL   = ${ENABLE_MAIL}"
+    echo "  DNS    = ${ENABLE_DNS}"
+    echo "  MONITOR= ${ENABLE_MONITOR}"
+    echo "  AI     = ${ENABLE_AI}"
+    echo "  ARR    = ${ENABLE_ARR}"
+    echo "  CROWDSEC = ${ENABLE_CROWDSEC}"
     echo "  HA     = ${ENABLE_HOMEASSISTANT}"
     echo "  JELLY  = ${ENABLE_JELLYFIN}"
+    echo "  COLLAB = ${ENABLE_COLLABORA}"
+    echo "  ONLYOF = ${ENABLE_ONLYOFFICE}"
     echo
 
     if [[ "$ANSWERS_FILE_LOADED" == "true" ]]; then
@@ -103,82 +112,103 @@ configure_variables() {
     lsblk -o NAME,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS
     echo
 
-    if [[ "$ANSWERS_FILE_LOADED" != "true" ]]; then
+    # Volume existant (RAID mdadm, LVM, ext4/xfs/btrfs) : détecté, jamais formaté, on demande quoi faire.
+    case "$DATA_MODE" in
+        disk | thin) ;;
+        *) die "DATA_MODE='${DATA_MODE}' invalide (disk | thin)." ;;
+    esac
 
-        read -r -p "Disque DATA [${DATA_DISK}] : " input
+    if [[ "$DATA_MODE" != "thin" && -z "$DATA_EXISTING_DEVICE" && "$ANSWERS_FILE_LOADED" != "true" ]]; then
+        choose_existing_volume
+    fi
 
-        if [[ -n "$input" ]]; then
-            DATA_DISK="$input"
-        fi
+    if [[ "$DATA_MODE" == "thin" ]]; then
+
+        [[ -z "$DATA_EXISTING_DEVICE" ]] \
+            || die "DATA_MODE=thin est incompatible avec DATA_EXISTING_DEVICE (volume existant) : choisis l'un ou l'autre."
+
+        echo "============================================================"
+        echo " DATA = VOLUME MINCE ${DATA_THIN_POOL%%/*}/${DATA_THIN_LV} DANS ${DATA_THIN_POOL} (AUCUN DISQUE FORMATÉ)"
+        echo "============================================================"
+        echo
+
+    elif [[ -n "$DATA_EXISTING_DEVICE" ]]; then
+
+        assemble_existing_arrays
+
+        [[ -b "$DATA_EXISTING_DEVICE" ]] \
+            || die "Volume existant introuvable : ${DATA_EXISTING_DEVICE}"
+
+        echo
+        echo "============================================================"
+        echo " VOLUME EXISTANT RÉUTILISÉ : ${DATA_EXISTING_DEVICE} (AUCUN FORMATAGE)"
+        echo "============================================================"
+        echo
 
     else
 
-        info "Disque DATA (depuis ${ANSWERS_FILE}) : ${DATA_DISK}"
-    fi
+        if [[ "$ANSWERS_FILE_LOADED" != "true" ]]; then
 
-    DATA_PARTITION="${DATA_DISK}1"
+            # Liste des disques et grappes RAID détectés (système exclu) ; sinon saisie libre
+            if ! choose_data_disk; then
+                read -r -p "Disque DATA [${DATA_DISK}] : " input
+                [[ -z "$input" ]] || DATA_DISK="$input"
+            fi
 
-    [[ -b "$DATA_DISK" ]] \
-        || die "Disque DATA introuvable : ${DATA_DISK}"
+        else
 
-    # -------------------------------------------------------------------
-    # Garde-fou : interdiction de formater le disque de boot / système.
-    # On résout le disque racine et tout disque support d'un LV Proxmox
-    # (local-lvm), et on refuse si DATA_DISK correspond à l'un d'eux.
-    # -------------------------------------------------------------------
-
-    local root_source root_pkname candidate_name data_name
-    local -a protected_disks=()
-
-    data_name="$(basename "$DATA_DISK")"
-
-    root_source="$(findmnt -no SOURCE / 2>/dev/null || true)"
-
-    if [[ -n "$root_source" ]]; then
-
-        root_pkname="$(lsblk -no PKNAME "$root_source" 2>/dev/null || true)"
-
-        if [[ -n "$root_pkname" ]]; then
-            protected_disks+=("$root_pkname")
+            info "Disque DATA (depuis ${ANSWERS_FILE}) : ${DATA_DISK}"
         fi
-    fi
 
-    while read -r candidate_name; do
+        DATA_PARTITION="$(data_partition_for "$DATA_DISK")"
 
-        [[ -n "$candidate_name" ]] || continue
+        [[ -b "$DATA_DISK" ]] \
+            || die "Disque DATA introuvable : ${DATA_DISK}"
 
-        protected_disks+=("$candidate_name")
+        # -------------------------------------------------------------------
+        # Garde-fou : interdiction de formater le disque de boot / système.
+        # On résout le disque racine et tout disque support d'un LV Proxmox
+        # (local-lvm), et on refuse si DATA_DISK correspond à l'un d'eux.
+        # -------------------------------------------------------------------
 
-    done < <(lsblk -no PKNAME,MOUNTPOINTS 2>/dev/null |
-        awk '$2 ~ /^\/(boot|)$/ && $1 != "" {print $1}' |
-        sort -u)
+        # Garde-fou : le disque système/boot (ou un disque portant un LV pve) ne peut pas être formaté, ni une
+        # grappe RAID dont un membre est dans ce cas.
+        local candidate_name
+        local -a protected_disks=()
 
-    for candidate_name in "${protected_disks[@]}"; do
+        while read -r candidate_name; do
+            [[ -n "$candidate_name" ]] && protected_disks+=("$candidate_name")
+        done < <(protected_disk_names)
 
-        if [[ "$data_name" == "$candidate_name" ]]; then
+        local under
+        while read -r under; do
+            [[ -n "$under" ]] || continue
+            for candidate_name in "${protected_disks[@]}"; do
+                if [[ "$under" == "$candidate_name" ]]; then
+                    die "${DATA_DISK} semble être le disque système/boot de Proxmox, ou en contient un (protection automatique). Abandon."
+                fi
+            done
+        done < <(lsblk -nso NAME "$DATA_DISK" 2>/dev/null | tr -d '└├─│ ')
 
-            die \
-                "${DATA_DISK} semble être le disque système/boot de Proxmox (protection automatique). Abandon."
+        echo
+        echo "============================================================"
+        echo " LE DISQUE ${DATA_DISK} SERA REPARTITIONNÉ ET FORMATÉ EN EXT4"
+        echo "============================================================"
+        echo
+
+        if [[ "$ANSWERS_FILE_LOADED" != "true" ]]; then
+
+            read -r -p "Tape exactement FORMAT-YES pour continuer : " FORMAT_CONFIRMATION
+
+        else
+
+            info "Confirmation de formatage lue depuis ${ANSWERS_FILE}."
         fi
-    done
 
-    echo
-    echo "============================================================"
-    echo " LE DISQUE ${DATA_DISK} SERA REPARTITIONNÉ ET FORMATÉ EN EXT4"
-    echo "============================================================"
-    echo
+        [[ "$FORMAT_CONFIRMATION" == "FORMAT-YES" ]] \
+            || die "Confirmation incorrecte (FORMAT_CONFIRMATION doit valoir exactement FORMAT-YES). Abandon."
 
-    if [[ "$ANSWERS_FILE_LOADED" != "true" ]]; then
-
-        read -r -p "Tape exactement FORMAT-YES pour continuer : " FORMAT_CONFIRMATION
-
-    else
-
-        info "Confirmation de formatage lue depuis ${ANSWERS_FILE}."
     fi
-
-    [[ "$FORMAT_CONFIRMATION" == "FORMAT-YES" ]] \
-        || die "Confirmation incorrecte (FORMAT_CONFIRMATION doit valoir exactement FORMAT-YES). Abandon."
 
     echo
 
@@ -266,6 +296,7 @@ generate_app_secrets() {
     [[ -n "$SYNCIN_SECRET_4" ]]          || SYNCIN_SECRET_4="$(openssl rand -hex 32)"
 
     [[ -n "$IMMICH_DB_PASSWORD" ]]       || IMMICH_DB_PASSWORD="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9')"
+    [[ -n "$ONLYOFFICE_JWT_SECRET" ]]    || ONLYOFFICE_JWT_SECRET="$(openssl rand -hex 32)"
 
     local secret_var
 
@@ -273,7 +304,7 @@ generate_app_secrets() {
         NEXTCLOUD_ADMIN_PASSWORD NEXTCLOUD_DB_PASSWORD \
         SYNCIN_ADMIN_PASSWORD SYNCIN_DB_PASSWORD SYNCIN_DB_ROOT_PASSWORD \
         SYNCIN_SECRET_1 SYNCIN_SECRET_2 SYNCIN_SECRET_3 SYNCIN_SECRET_4 \
-        IMMICH_DB_PASSWORD
+        IMMICH_DB_PASSWORD ONLYOFFICE_JWT_SECRET
     do
         [[ -n "${!secret_var}" ]] \
             || die "Échec de génération du secret ${secret_var}."

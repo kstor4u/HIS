@@ -1,0 +1,21 @@
+{
+  "_note": "Un fichier par serveur Proxmox à sauvegarder : /etc/homelab-backup/sources.d/<nom>.json (le nom, sans .json, est celui de la source). Normalement généré par le serveur : homelab-backup-ctl request <nom>, puis add-source. null = valeur par défaut.",
+  "HOST": "10.10.10.1",
+  "PORT": 22,
+  "USER": "backup-pull",
+  "WG_CONF": "prod",
+  "SSH_KEY": null,
+  "THRESHOLD": null,
+  "EXCLUDES": [],
+  "PATHS": [
+    "proxmox/dump",
+    "ipassed.fr/SHARED",
+    "ipassed.fr/apps"
+  ],
+  "CANARIES": [
+    "ipassed.fr/SHARED/00_temoin/temoin.docx",
+    "ipassed.fr/SHARED/00_temoin/temoin.jpg",
+    "ipassed.fr/SHARED/00_temoin/temoin.avi",
+    "ipassed.fr/apps/00_temoin/temoin.docx"
+  ]
+}

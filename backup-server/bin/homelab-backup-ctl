@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Outil d'administration du serveur de sauvegarde.
+set -Eeuo pipefail
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf
+
+usage() {
+    cat <<U
+Usage : homelab-backup-ctl <commande>
+  status                 état : sources, instantanés, alertes, prochain réveil
+  run                    lance une sauvegarde maintenant (pas d'extinction)
+  ack <source> [--discard]
+                         acquitte une alerte. Sans option : les instantanés suspects sont acceptés
+                         et deviennent la nouvelle référence. Avec --discard : ils sont supprimés
+                         et le miroir est ramené au dernier instantané valide.
+  volume                 détecte et monte le RAID / disque de sauvegarde existant (sans formater)
+  update-conf            ajoute à backup.json les variables apparues avec une nouvelle version (tes valeurs conservées)
+  describe [NOM]         explique les variables de backup.json (NOM ou début de nom ; sans argument : toutes)
+  version                version du serveur de sauvegarde
+  restoretest [source]   test de restauration (échantillon, dumps de bases, archives vzdump)
+  check                  contrôle RAID + intégrité des sauvegardes maintenant (reprend s'il était interrompu)
+  repair <source>        recopie depuis le serveur source (comparaison du contenu) pour réparer des fichiers corrompus
+  dhcp [--now]           passe le réseau de ce serveur en DHCP (à appliquer au prochain démarrage, ou --now)
+  keep-on | keep-off     empêche / autorise l'extinction automatique (maintenance)
+  totp-show              affiche le secret de double authentification des actions Telegram (+ QR code)
+  totp-reset             génère un nouveau secret (l'ancien cesse de fonctionner)
+  arm                    programme le prochain réveil sans éteindre
+  poweroff               programme le prochain réveil et éteint maintenant
+  export <périphérique|--dir dossier>   exporte vers un disque externe (normalement automatique)
+  test-mail              envoie un mail de test
+  request <nom>          prépare la demande à donner au serveur Proxmox (clés publiques SSH + WireGuard, affichées en une ligne)
+  add-source <HBSRC2:...|fichier>
+                         installe le fichier source et la config WireGuard générés par le serveur, puis les teste
+  test-source <nom>      teste tunnel, SSH, dossiers et fichiers témoins d'une source (sans rien copier)
+  test-notify            envoie un message de test sur Telegram
+  telegram-id            affiche les discussions qui ont écrit au bot (pour TELEGRAM_CHAT_ID)
+  diagnose               décrit RAID / disques / montage (pour retrouver le format du RAID)
+U
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+status)
+    echo "Volume : $BACKUP_ROOT ($(mountpoint -q "${BACKUP_MOUNT:-$BACKUP_ROOT}" && echo monté || echo 'NON MONTÉ'))  libre : $(df -h --output=avail "$BACKUP_ROOT" 2>/dev/null | tail -n1 | xargs)"
+    nw="$(cat "$HB_STATE/next-wake" 2>/dev/null || echo 0)"
+    echo "Prochain réveil : $( (( nw > 0 )) && date -d "@$nw" '+%F %T' || echo 'non armé (homelab-backup-ctl arm)')"
+    [[ -e "$HB_STATE/keep-on" ]] && echo "Extinction automatique : DÉSACTIVÉE (keep-on)"
+    for n in $(hb_source_names); do
+        echo "--- $n  (référence : $(cat "$HB_STATE/$n.baseline" 2>/dev/null || echo '-') fichiers)"
+        [[ -f "$HB_STATE/$n.alert" ]] && echo "    ⚠ ALERTE : $(cat "$HB_STATE/$n.alert")"
+        find "$BACKUP_ROOT/$n/snaps" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp-*' -printf '    %f\n' 2>/dev/null | sort
+    done
+    ;;
+run)
+    exec /usr/local/sbin/homelab-backup-run --force
+    ;;
+volume)
+    exec /usr/local/sbin/homelab-backup-volume
+    ;;
+check)
+    exec /usr/local/sbin/homelab-backup-check
+    ;;
+update-conf)
+    hb_merge_conf "$HB_SCHEMA" "$HB_ETC/backup.json" || true
+    ;;
+describe)
+    hb_describe "${1:-}"
+    ;;
+version)
+    echo "homelab-backup $HB_VERSION"
+    ;;
+restoretest)
+    exec /usr/local/sbin/homelab-backup-restoretest "$@"
+    ;;
+repair)
+    name="${1:?source manquante}"
+    exec /usr/local/sbin/homelab-backup-run --force --only "$name" --checksum
+    ;;
+dhcp)
+    exec /usr/local/sbin/homelab-backup-net dhcp "$@"
+    ;;
+ack)
+    name="${1:?source manquante}"; opt="${2:-}"
+    [[ -f "$HB_STATE/$name.alert" ]] || { echo "Aucune alerte pour $name."; exit 0; }
+    snaps="$BACKUP_ROOT/$name/snaps"
+    if [[ "$opt" == "--discard" ]]; then
+        rm -rf "$snaps"/*.SUSPECT
+        last="$(hb_snap_valid_list "$name" | tail -n1)"
+        if [[ -n "$last" ]]; then
+            rsync -aHAX --numeric-ids --delete "$snaps/$last/" "$BACKUP_ROOT/$name/mirror/" >/dev/null
+            echo "Miroir ramené à $last. La prochaine sauvegarde se comparera à cet état."
+        fi
+    else
+        for s in "$snaps"/*.SUSPECT; do
+            [[ -d "$s" ]] || continue
+            mv "$s" "${s%.SUSPECT}" 2>/dev/null || mv "$s" "${s%.SUSPECT}_ack"
+        done
+        # Nouvelle référence = nombre de fichiers du dernier instantané
+        last="$(hb_snap_valid_list "$name" | tail -n1)"
+        [[ -n "$last" ]] && find "$snaps/$last" -type f | wc -l > "$HB_STATE/$name.baseline"
+        # Les témoins sont réappris depuis l'état accepté
+        rm -f "$HB_STATE/$name.canaries"
+        echo "Alerte acquittée : référence = $(cat "$HB_STATE/$name.baseline") fichiers."
+    fi
+    rm -f "$HB_STATE/$name.alert"
+    ;;
+totp-show|totp-reset)
+    [[ "$cmd" == totp-reset ]] && rm -f "$HB_ETC/totp.secret" "$HB_STATE/totp.last" "$HB_STATE/actions.lock"
+    if [[ ! -s "$HB_ETC/totp.secret" ]]; then ( umask 077; python3 /usr/local/lib/homelab-backup/totp.py new > "$HB_ETC/totp.secret" ); chmod 600 "$HB_ETC/totp.secret"; fi
+    uri="$(python3 /usr/local/lib/homelab-backup/totp.py uri "$HB_ETC/totp.secret" "$(hostname -s)" Sauvegarde)"
+    echo "Ajoute ce secret dans ton application d'authentification (6 chiffres, 30 s) :"
+    echo "  Secret : $(cat "$HB_ETC/totp.secret")"; echo "  URI    : $uri"
+    if command -v qrencode >/dev/null 2>&1 || apt-get install -y qrencode >/dev/null 2>&1; then qrencode -t ansiutf8 "$uri" || true; fi
+    echo "Ne le range PAS dans Telegram."
+    ;;
+keep-on)  touch "$HB_STATE/keep-on";  echo "Extinction automatique désactivée." ;;
+keep-off) rm -f "$HB_STATE/keep-on"; echo "Extinction automatique réactivée." ;;
+arm)
+    next="$(hb_next_wake_epoch)"; echo "$next" > "$HB_STATE/next-wake"
+    echo "Prochain réveil prévu : $(date -d "@$next" '+%F %T') (l'alarme est posée à l'extinction)."
+    ;;
+poweroff)
+    next="$(hb_next_wake_epoch)"; echo "$next" > "$HB_STATE/next-wake"
+    echo "Extinction, réveil le $(date -d "@$next" '+%F %T')"; sync
+    exec rtcwake -m off -t "$next"
+    ;;
+export)
+    exec /usr/local/sbin/homelab-backup-export "$@"
+    ;;
+test-mail)
+    hb_mail "[Sauvegarde] Mail de test" "Si tu lis ceci, les alertes par mail fonctionnent. ($(hostname), $(date))"
+    echo "Envoyé (voir $HB_LOG en cas d'échec)."
+    ;;
+request)
+    name="${1:-}"
+    [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,11}$ ]] || { echo "usage : homelab-backup-ctl request <nom>  (1 à 12 caractères a-z 0-9 -)"; exit 1; }
+    install -d -m 700 /root/.ssh "$HB_ETC/wg"
+    [[ -f /root/.ssh/homelab-pull ]] || ssh-keygen -q -t ed25519 -N '' -C "homelab-backup@$(hostname -s)" -f /root/.ssh/homelab-pull
+    if [[ ! -f "$HB_ETC/wg/$name.key" ]]; then
+        ( umask 077; wg genkey > "$HB_ETC/wg/$name.key" )
+    fi
+    chmod 600 "$HB_ETC/wg/$name.key"
+    wgpub="$(wg pubkey < "$HB_ETC/wg/$name.key")"
+    sshpub="$(cut -d' ' -f1,2 /root/.ssh/homelab-pull.pub)"
+    tok="HBREQ1:$(printf 'name=%s\nssh=%s\nwg=%s\n' "$name" "$sshpub" "$wgpub" | base64 -w0)"
+    echo "Demande pour la source '$name' (aucune clé privée dedans). Sur le serveur Proxmox :"
+    echo
+    echo "  ./install.sh --run backup_source_export $name '$tok'"
+    echo
+    echo "Puis ici : homelab-backup-ctl add-source '<HBSRC2:...>'"
+    ;;
+add-source)
+    arg="${1:-}"
+    [[ -n "$arg" ]] || { echo "usage : homelab-backup-ctl add-source <HBSRC2:...|fichier>"; exit 1; }
+    if [[ -f "$arg" ]]; then pkg="$(cat "$arg")"
+    elif [[ "$arg" == HBSRC2:* ]]; then pkg="$(printf '%s' "${arg#HBSRC2:}" | base64 -d 2>/dev/null)" || { echo "Paquet illisible."; exit 1; }
+    else echo "Argument inconnu : donne un paquet HBSRC2:... ou un fichier."; exit 1; fi
+    [[ "$(head -n1 <<< "$pkg")" == "#HBSRC2" ]] || { echo "Ce n'est pas un paquet HBSRC2 (paquet d'une ancienne version de l'installateur ? refais la demande : homelab-backup-ctl request <nom>)."; exit 1; }
+    name="$(sed -n 's/^name=//p' <<< "$pkg" | head -n1)"
+    [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,11}$ ]] || { echo "Nom de source invalide dans le paquet."; exit 1; }
+    install -d -m 755 "$HB_ETC/sources.d"
+    # extraction des blocs @@FILE <chemin> ... @@END (seuls deux chemins sont acceptés)
+    for rel in "sources.d/$name.json" "wireguard/$name.conf"; do
+        body="$(awk -v f="@@FILE $rel" '$0==f{on=1;next} $0=="@@END"{on=0} on' <<< "$pkg")"
+        [[ -n "$body" ]] || continue
+        case "$rel" in
+        sources.d/*)
+            jq -e 'type == "object" and (.HOST | type) == "string" and (.PATHS | type) == "array"' <<< "$body" > /dev/null 2>&1 \
+                || { echo "Fichier source invalide : JSON attendu avec HOST et PATHS."; exit 1; }
+            if [[ -f "$HB_ETC/$rel" ]]; then cp -a "$HB_ETC/$rel" "$HB_ETC/$rel.bak.$(date +%s)"; echo "Ancien $rel sauvegardé (.bak)."; fi
+            printf '%s\n' "$body" > "$HB_ETC/$rel"; chmod 600 "$HB_ETC/$rel"; echo "Installé : $HB_ETC/$rel" ;;
+        wireguard/*)
+            [[ -f "$HB_ETC/wg/$name.key" ]] || { echo "Clé privée absente : lance d'abord 'homelab-backup-ctl request $name' (la demande doit venir de CE serveur)."; exit 1; }
+            priv="$(cat "$HB_ETC/wg/$name.key")"
+            install -d -m 700 /etc/wireguard
+            ( umask 077; awk -v k="$priv" '{gsub(/@WG_PRIVATE_KEY@/,k)}1' <<< "$body" > "/etc/wireguard/$name.conf" )
+            chmod 600 "/etc/wireguard/$name.conf"; echo "Installé : /etc/wireguard/$name.conf (clé privée locale insérée)" ;;
+        esac
+    done
+    [[ -f "$HB_ETC/sources.d/$name.json" ]] || { echo "Le paquet ne contient pas de fichier source."; exit 1; }
+    echo; exec "$0" test-source "$name"
+    ;;
+test-source)
+    name="${1:-}"
+    [[ -f "$HB_ETC/sources.d/$name.json" ]] || { echo "Source inconnue : $name"; exit 1; }
+    ( HOST=""; USER=""; PORT=""; PATHS=""; CANARIES=""; WG_CONF=""; SSH_KEY=""; THRESHOLD=""; EXCLUDES=""
+      hb_source_load "$name" || { echo "ÉCHEC configuration de la source '$name' : ${HB_SRC_ERR}"; exit 1; }
+      ok=0; iface=""
+      cleanup() { [[ -n "$iface" ]] && wg-quick down "$iface" >/dev/null 2>&1 || true; }
+      trap cleanup EXIT
+      if [[ -n "$WG_CONF" ]]; then
+          iface="$(basename "$WG_CONF" .conf)"
+          wg-quick down "$iface" >/dev/null 2>&1 || true
+          wg-quick up "$WG_CONF" >/dev/null 2>&1 && echo "OK   tunnel WireGuard monté" || { echo "ÉCHEC tunnel WireGuard ($WG_CONF)"; exit 1; }
+          for _ in $(seq 1 20); do
+              [[ "$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}' | head -n1)" -gt 0 ]] 2>/dev/null && { ok=1; break; }
+              sleep 1
+          done
+          (( ok )) && echo "OK   poignée de main WireGuard" || { echo "ÉCHEC pas de poignée de main (pair non créé côté serveur ? port UDP ouvert ?)"; exit 1; }
+      fi
+      sshc=(ssh -i "$SSH_KEY" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20)
+      rc=0
+      for p in $PATHS; do
+          if rsync -a --list-only -e "${sshc[*]}" "$USER@$HOST:$p/" >/dev/null 2>&1; then echo "OK   dossier lisible : $p"
+          else echo "ÉCHEC dossier illisible : $p"; rc=1; fi
+      done
+      for c in $CANARIES; do
+          if rsync -a --list-only -e "${sshc[*]}" "$USER@$HOST:$c" >/dev/null 2>&1; then echo "OK   témoin présent : $c"
+          else echo "ATTENTION témoin introuvable : $c"; fi
+      done
+      exit $rc
+    )
+    ;;
+test-notify)
+    [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || { echo "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID absents de $HB_ETC/backup.json"; exit 1; }
+    TELEGRAM_EVENTS="all" hb_notify backup "Message de test" "Si tu lis ceci, les alertes Telegram fonctionnent ($(date '+%F %T'))."
+    echo "Envoyé (voir $HB_LOG en cas d'échec)."
+    ;;
+telegram-id)
+    [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || { echo "Renseigne TELEGRAM_BOT_TOKEN dans $HB_ETC/backup.json, écris un message à ton bot, puis relance."; exit 1; }
+    resp="$(printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$TELEGRAM_BOT_TOKEN" | curl -sS --max-time 20 -K - 2>/dev/null || true)"
+    command -v jq >/dev/null 2>&1 || apt-get install -y jq >/dev/null 2>&1 || true
+    jq -e '.ok == true' >/dev/null 2>&1 <<< "$resp" || { echo "Réponse invalide : jeton incorrect ?"; exit 1; }
+    echo "Discussions ayant écrit au bot :"
+    jq -r '[.result[].message.chat | select(. != null) | "\(.id)  \(.first_name // .title // "")  (\(.type))"] | unique | .[]' <<< "$resp" | sed 's/^/  /'
+    ;;
+diagnose)
+    echo "=== Montage de $BACKUP_ROOT"; findmnt "$BACKUP_ROOT" || echo "(non monté)"
+    echo; echo "=== Disques et systèmes de fichiers"; lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT
+    echo; echo "=== RAID mdadm"; cat /proc/mdstat 2>/dev/null || true
+    command -v mdadm >/dev/null && mdadm --detail --scan 2>/dev/null || true
+    echo; echo "=== ZFS"; command -v zpool >/dev/null && zpool status 2>/dev/null || echo "(pas de ZFS)"
+    echo; echo "=== btrfs"; command -v btrfs >/dev/null && btrfs filesystem show 2>/dev/null || echo "(pas de btrfs)"
+    echo; echo "=== LVM"; command -v lvs >/dev/null && lvs 2>/dev/null || echo "(pas de LVM)"
+    ;;
+*) usage; exit 1;;
+esac

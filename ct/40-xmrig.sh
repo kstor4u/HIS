@@ -44,6 +44,14 @@ create_xmrig_ct() {
         return 0
     fi
 
+    # Le CT monte HUGEPAGES_MOUNT : sans lui, le pre-start de LXC échoue
+    # (cas de --run create_xmrig_ct lancé seul, sans configure_hugepages).
+    if ! mountpoint -q "$HUGEPAGES_MOUNT" 2>/dev/null; then
+        info "XMRig : hugepages absentes, configuration préalable..."
+        configure_hugepages
+        configure_msr_optimization
+    fi
+
     download_debian_lxc_template
 
     local TEMPLATE="$DOWNLOADED_TEMPLATE"
@@ -56,7 +64,7 @@ create_xmrig_ct() {
         --cores "$XMRIG_CORES" \
         --memory "$XMRIG_MEMORY" \
         --swap 1024 \
-        --rootfs "local-lvm:${XMRIG_DISK%G}" \
+        --rootfs "${GUEST_STORAGE}:${XMRIG_DISK%G}" \
         --net0 "name=eth0,bridge=${PRIVATE_BRIDGE},firewall=1,gw=${XMRIG_GATEWAY},ip=${XMRIG_IP}" \
         --unprivileged 1 \
         --onboot 1 \
@@ -65,7 +73,10 @@ create_xmrig_ct() {
     pct set "$XMRIG_ID" \
         --mp0 "${HUGEPAGES_MOUNT},mp=${HUGEPAGES_MOUNT}"
 
-    pct start "$XMRIG_ID"
+    if ! pct start "$XMRIG_ID"; then
+        pct destroy "$XMRIG_ID" --purge >/dev/null 2>&1 || true
+        die "Le CT XMRig ${XMRIG_ID} ne démarre pas : supprimé pour permettre une nouvelle tentative (diagnostic : pct start ${XMRIG_ID} --debug)."
+    fi
 
     pct_wait_for_network "$XMRIG_ID"
 
@@ -306,6 +317,25 @@ start_xmrig() {
         systemctl start xmrig
 
     rm -f "$STATE_FILE"
+
+    notify_miner low "Mineur relancé" "Charge CPU des autres charges redescendue : ${OTHER_CPU:-?}%." white_check_mark
+}
+
+# Alerte (Telegram/ntfy via homelab-notify s'il est installé) ; un arrêt au plus toutes les 30 min.
+notify_miner() {
+
+    local prio="$1" title="$2" msg="$3" tags="$4" stamp="/run/xmrig-monitor.notified"
+
+    [[ -x /usr/local/sbin/homelab-notify ]] || return 0
+
+    if [[ "$prio" == "default" ]]; then
+        if [[ -f "$stamp" ]] && (( $(date +%s) - $(stat -c %Y "$stamp") < 1800 )); then
+            return 0
+        fi
+        touch "$stamp"
+    fi
+
+    /usr/local/sbin/homelab-notify -p "$prio" -t "$tags" -c miner "$title" "$msg" || true
 }
 
 stop_xmrig() {
@@ -314,6 +344,9 @@ stop_xmrig() {
         systemctl stop xmrig
 
     printf '%s\n' "PAUSED_BY_MONITOR" > "$STATE_FILE"
+
+    notify_miner default "Mineur arrêté (charge CPU)" \
+        "Les autres charges utilisent ${OTHER_CPU:-?}% du CPU (seuil d'arrêt ${STOP_THRESHOLD}%). Reprise automatique sous ${RESUME_THRESHOLD}% pendant ${RESUME_DELAY} s." warning
 }
 
 resume_since=0

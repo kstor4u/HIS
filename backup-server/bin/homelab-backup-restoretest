@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Test de restauration : vérifie que ce qui est sauvegardé est RÉELLEMENT récupérable, pas seulement présent.
+#   1. échantillon de fichiers : copie aléatoire depuis le dernier instantané valide, comparée octet par octet ;
+#      les fichiers témoins sont toujours inclus ;
+#   2. dumps de bases (<site>/apps/backups/db, un dossier par site) : le plus récent de chaque base de chaque site est
+#      contrôlé (archive lisible, fin de dump présente pour PostgreSQL/MariaDB) ;
+#   3. archives vzdump (proxmox/dump) : la plus récente de chaque VM/CT est lue en entier (zstd/gzip/lzo -t) ;
+#   4. (option RESTORE_TEST_STORAGE) restauration réelle de la plus petite archive de CT dans un CT temporaire
+#      NON démarré et sans réseau, puis suppression.
+# Usage : homelab-backup-restoretest [source ...]     Code : 0 = tout va bien, 1 = problème
+set -Eeuo pipefail
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf
+
+SAMPLE="${RESTORE_SAMPLE:-40}"
+TMP_ID="${RESTORE_TEST_ID:-9990}"
+STORAGE="${RESTORE_TEST_STORAGE:-}"
+WORK="$(mktemp -d "${HB_STATE:-/var/tmp}/restoretest.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+PROBLEMS=0 CHECKS=0
+OUT=""
+say()  { echo "$*"; OUT+="$*"$'\n'; }
+ok()   { CHECKS=$(( CHECKS + 1 )); say "  OK     $*"; }
+bad()  { CHECKS=$(( CHECKS + 1 )); PROBLEMS=$(( PROBLEMS + 1 )); say "  ÉCHEC  $*"; }
+
+# Dossier à tester : dernier instantané valide, sinon le miroir.
+snapshot_dir() {
+    local s="$1" last
+    last="$(hb_snap_valid_list "$s" | tail -n 1)"
+    if [[ -n "$last" ]]; then echo "$BACKUP_ROOT/$s/snaps/$last"; elif [[ -d "$BACKUP_ROOT/$s/mirror" ]]; then echo "$BACKUP_ROOT/$s/mirror"; fi
+}
+
+test_sample() {
+    local root="$1" list="$WORK/list" f n=0 bad_n=0 canary
+    : > "$list"
+    # Témoins déclarés dans la source (toujours testés)
+    for canary in ${CANARIES:-}; do [[ -f "$root/$canary" ]] && echo "$root/$canary" >> "$list"; done
+    find "$root" -type f ! -path '*/backups/db/*' -size +0 -print0 2>/dev/null | shuf -z -n "$SAMPLE" | tr '\0' '\n' >> "$list"
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        n=$(( n + 1 ))
+        cp -- "$f" "$WORK/sample.bin" 2>/dev/null && cmp -s -- "$f" "$WORK/sample.bin" || { bad "fichier illisible ou altéré : ${f#"$root"/}"; bad_n=$(( bad_n + 1 )); }
+    done < "$list"
+    rm -f "$WORK/sample.bin"
+    (( bad_n == 0 )) && ok "$n fichier(s) restaurés par copie et identiques (dont témoins)"
+    return 0
+}
+
+# Un dossier de dumps par site : <site>/apps/backups/db/<cible>/ (ancienne arborescence sans site : apps/backups/db/<cible>/).
+test_dumps() {
+    local root="$1" dbroot rel site d t f lbl found=0
+    local -a roots=()
+    mapfile -t roots < <(hb_source_sites "$root")
+    (( ${#roots[@]} > 0 )) || { say "  --     pas de dumps de bases dans cette sauvegarde"; return 0; }
+    for dbroot in "${roots[@]}"; do
+        rel="${dbroot#"$root"/}"; site="${rel%apps/backups/db}"; site="${site%/}"
+        for d in "$dbroot"/*/; do
+            [[ -d "$d" ]] || continue
+            t="$(basename "$d")"; lbl="${site:+${site}/}${t}"
+            f="$(find "$d" -maxdepth 1 -type f -printf '%T@ %p\n' | sort -n | tail -n 1 | cut -d' ' -f2-)"
+            [[ -n "$f" ]] || continue
+            found=1
+            case "$f" in
+                *.sql.gz)
+                    if ! gzip -t "$f" 2>/dev/null; then bad "dump $lbl : archive gzip corrompue ($(basename "$f"))"
+                    elif zcat "$f" | tail -n 5 | grep -qiE 'dump complete|dump completed'; then ok "dump $lbl : complet ($(basename "$f"))"
+                    else bad "dump $lbl : fin de dump absente (écriture interrompue ?) ($(basename "$f"))"; fi ;;
+                *.gz) gzip -t "$f" 2>/dev/null && ok "dump $lbl : archive lisible ($(basename "$f"))" || bad "dump $lbl : archive corrompue ($(basename "$f"))" ;;
+                *.tgz) tar tzf "$f" >/dev/null 2>&1 && ok "dump $lbl : archive lisible ($(basename "$f"))" || bad "dump $lbl : archive corrompue ($(basename "$f"))" ;;
+                *) [[ -s "$f" ]] && ok "dump $lbl : présent ($(basename "$f"))" || bad "dump $lbl : vide" ;;
+            esac
+        done
+    done
+    (( found )) || say "  --     dossiers de dumps vides"
+}
+
+arch_test() {   # $1 = archive vzdump
+    case "$1" in
+        *.zst)  zstd -tq -- "$1" ;;
+        *.gz)   gzip -t -- "$1" ;;
+        *.lzo)  lzop -tq -- "$1" ;;
+        *.vma|*.tar) [[ -s "$1" ]] ;;
+        *) return 0 ;;
+    esac
+}
+
+test_vzdump() {
+    local root="$1" dir="$root/proxmox/dump" id f smallest="" size best=0
+    [[ -d "$dir" ]] || { say "  --     pas d'archives vzdump dans cette sauvegarde"; return 0; }
+    declare -A newest=()
+    while IFS= read -r f; do
+        id="$(basename "$f" | sed -E 's/^vzdump-(lxc|qemu)-([0-9]+)-.*/\1-\2/')"
+        newest["$id"]="$f"     # find trié par nom => la dernière écrase
+    done < <(find "$dir" -maxdepth 1 -type f -name 'vzdump-*' ! -name '*.log' ! -name '*.notes' ! -name '*.vma.*.tmp' | sort)
+    (( ${#newest[@]} > 0 )) || { say "  --     aucune archive vzdump"; return 0; }
+    for id in "${!newest[@]}"; do
+        f="${newest[$id]}"
+        if arch_test "$f" 2>/dev/null; then ok "vzdump $id : archive lue en entier ($(basename "$f"))"; else bad "vzdump $id : archive corrompue ($(basename "$f"))"; fi
+        if [[ "$id" == lxc-* ]]; then
+            size="$(stat -c %s "$f")"
+            (( best == 0 || size < best )) && { best="$size"; smallest="$f"; }
+        fi
+    done
+    # Restauration réelle d'un CT (facultative).
+    if [[ -n "$STORAGE" && -n "$smallest" ]] && command -v pct >/dev/null 2>&1; then
+        if pct status "$TMP_ID" >/dev/null 2>&1; then
+            bad "restauration réelle : l'identifiant $TMP_ID est déjà utilisé (change RESTORE_TEST_ID)"
+        elif pct restore "$TMP_ID" "$smallest" --storage "$STORAGE" --unprivileged 1 >/dev/null 2>&1 \
+             && pct config "$TMP_ID" >/dev/null 2>&1; then
+            ok "restauration réelle : $(basename "$smallest") restauré en CT $TMP_ID (non démarré)"
+            pct destroy "$TMP_ID" --purge >/dev/null 2>&1 || say "  ATTENTION : supprime à la main le CT temporaire $TMP_ID"
+        else
+            bad "restauration réelle impossible : $(basename "$smallest")"
+            pct destroy "$TMP_ID" --purge >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+sources=("$@")
+(( ${#sources[@]} > 0 )) || mapfile -t sources < <(hb_source_names)
+(( ${#sources[@]} > 0 )) || { say "Aucune source configurée."; exit 0; }
+
+hb_notify restore "Test de restauration démarré" "Sources : ${sources[*]}"
+for s in "${sources[@]}"; do
+    say "Test de restauration [$s]"
+    CANARIES="$( HOST=""; CANARIES=""; hb_source_load "$s" >/dev/null 2>&1 && printf '%s' "$CANARIES" || true )"
+    root="$(snapshot_dir "$s")"
+    if [[ -z "$root" ]]; then bad "aucune sauvegarde à tester"; continue; fi
+    say "  source : ${root#"$BACKUP_ROOT"/}"
+    test_sample "$root"
+    test_dumps "$root"
+    test_vzdump "$root"
+done
+
+say "Bilan : $CHECKS contrôle(s), $PROBLEMS problème(s)."
+date +%s > "$HB_STATE/restoretest.last" 2>/dev/null || true
+if (( PROBLEMS == 0 )); then hb_notify restore "Test de restauration : OK" "$OUT"; else hb_notify alert "Test de restauration : ${PROBLEMS} PROBLÈME(S)" "$OUT"; fi
+(( PROBLEMS == 0 ))

@@ -1,5 +1,16 @@
-# Ne jamais versionner les secrets ni les fichiers générés.
+# Jamais de secrets ni de fichiers générés dans git
+proxmox-homelab-answers.json
+proxmox-homelab-secrets.json
+backup.json
+sources.d/
+wireguard/
 *.conf
 *.log
 *.bak*
-proxmox-homelab-answers.conf
+*.hbsrc
+*.pub
+*_key
+id_*
+# Sorties de build (script monolithique)
+proxmox-homelab-install-v*.sh
+proxmox-homelab-backup-server-install-v*.sh

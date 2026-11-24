@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Seul point d'entrée du bot Telegram vers le serveur de sauvegarde (appelé par sudo, liste fermée de verbes).
+# Usage : homelab-backup-actions <verbe> <cible|-> <code|-> <identifiant Telegram|->
+# Lecture seule : status cancel
+# Avec code TOTP : run check restoretest keep-on keep-off | poweroff reboot
+# Volontairement ABSENT : acquitter une alerte (ack/--discard), réparer, restaurer, modifier la configuration.
+set -u
+umask 077
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf || exit 1
+
+verb="${1:-}" target="${2:--}" code="${3:--}" who="${4:--}"
+TOTP="${HB_TOTP:-/usr/local/lib/homelab-backup/totp.py}"
+TOTP_SECRET="${HB_TOTP_SECRET:-$HB_ETC/totp.secret}"
+TOTP_STATE="$HB_STATE/totp.last"
+LOCK="$HB_STATE/actions.lock"
+ALOG="${HB_ACTIONS_LOG:-/var/log/homelab-backup-actions.log}"
+DELAY="${TELEGRAM_ACTION_DELAY:-60}"
+
+alog() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$who" "$*" >> "$ALOG" 2>/dev/null || true; }
+
+[[ "$verb" =~ ^[a-z-]{2,20}$ ]]   || { echo "Action invalide."; exit 2; }
+[[ "$target" =~ ^-$ ]]            || { echo "Cible invalide."; exit 2; }
+[[ "$code" =~ ^([0-9]{6}|-)$ ]]   || { echo "Code invalide (6 chiffres)."; exit 2; }
+[[ "$who" =~ ^([0-9]{1,15}|-)$ ]] || { echo "Identifiant invalide."; exit 2; }
+
+v_status() {
+    local nw
+    nw="$(cat "$HB_STATE/next-wake" 2>/dev/null || echo 0)"
+    echo "Serveur de sauvegarde : allumé depuis $(uptime -s 2>/dev/null || echo '?')"
+    echo "Prochain réveil : $( (( nw > 0 )) && date -d "@$nw" '+%F %T' || echo 'non armé')"
+    echo "Extinction automatique : $([[ -e "$HB_STATE/keep-on" ]] && echo 'DÉSACTIVÉE (keep-on)' || echo 'active')"
+    echo "Volume : $(mountpoint -q "${BACKUP_MOUNT:-$BACKUP_ROOT}" && df -Pk "${BACKUP_MOUNT:-$BACKUP_ROOT}" | awk 'NR==2 {printf "%s utilisé, %.0f Gio libres", $5, $4/1048576}' || echo 'NON MONTÉ')"
+    if pgrep -f homelab-backup-run >/dev/null 2>&1; then echo "Une sauvegarde est EN COURS."; fi
+    local s
+    for s in "$HB_STATE"/*.alert; do [[ -e "$s" ]] && echo "⚠️ Alerte en attente : $(basename "$s" .alert) (à examiner en SSH)"; done
+    return 0
+}
+
+case "$verb" in
+    status) v_status; exit 0 ;;
+    cancel)
+        if systemctl is-active --quiet homelab-backup-power-action.timer; then systemctl stop homelab-backup-power-action.timer && echo "Action annulée."
+        else echo "Aucune action programmée."; fi
+        alog cancel; exit 0 ;;
+    run|check|restoretest|keep-on|keep-off) group=backup ;;
+    poweroff|reboot) group=power ;;
+    *) echo "Action inconnue."; exit 2 ;;
+esac
+
+if [[ " ${TELEGRAM_ACTIONS:-} " != *" ${group} "* ]]; then echo "Action désactivée : « ${group} » n'est pas dans TELEGRAM_ACTIONS."; exit 3; fi
+[[ -r "$TOTP_SECRET" ]] || { echo "Double authentification non configurée (homelab-backup-ctl totp-show)."; exit 3; }
+
+now="$(date +%s)"; fails=0 first=0 until=0
+[[ -r "$LOCK" ]] && IFS='|' read -r fails first until < "$LOCK"
+[[ "$fails" =~ ^[0-9]+$ && "$first" =~ ^[0-9]+$ && "$until" =~ ^[0-9]+$ ]] || { fails=0; first=0; until=0; }
+if (( until > now )); then echo "Actions verrouillées encore $(( (until - now) / 60 + 1 )) min (trop de codes faux)."; alog "verrouillé : ${verb}"; exit 4; fi
+[[ "$code" != "-" ]] || { echo "Code requis : ajoute les 6 chiffres de ton application d'authentification."; exit 5; }
+
+python3 "$TOTP" verify "$TOTP_SECRET" "$TOTP_STATE" "$code"; rc=$?
+if (( rc != 0 )); then
+    (( now - first > 600 )) && { fails=0; first=$now; }
+    (( first == 0 )) && first=$now
+    fails=$(( fails + 1 ))
+    if (( fails >= 3 )); then until=$(( now + 1800 )); fails=0; first=0; fi
+    printf '%s|%s|%s\n' "$fails" "$first" "$until" > "$LOCK"
+    alog "CODE REFUSÉ (rc=${rc}) pour ${verb}"
+    hb_notify alert "Telegram : code refusé" "Tentative d'action « ${verb} » avec un mauvais code (utilisateur ${who}).$( (( until > now )) && echo ' Actions verrouillées 30 min.')"
+    hb_mail "[Sauvegarde] Telegram : code refusé" "Tentative d'action « ${verb} » avec un mauvais code (utilisateur ${who})." 2>/dev/null || true
+    if (( rc == 2 )); then echo "Code déjà utilisé : attends le suivant (30 s)."; else echo "Code refusé."; fi
+    exit 5
+fi
+rm -f "$LOCK"
+alog "OK ${verb}"
+hb_notify security "Telegram : action ${verb}" "Exécutée à la demande de l'utilisateur Telegram ${who} (code valide)."
+hb_mail "[Sauvegarde] Telegram : action ${verb}" "Exécutée à la demande de l'utilisateur Telegram ${who} (code valide)." 2>/dev/null || true
+
+run_unit() { local unit="$1"; shift; systemctl is-active --quiet "$unit" && { echo "Déjà en cours."; return 6; }; systemd-run --unit="$unit" --collect --quiet "$@"; }
+
+case "$verb" in
+    run)         run_unit homelab-backup-manual /usr/local/sbin/homelab-backup-run --force || exit $?
+                 echo "Sauvegarde lancée (sans extinction automatique ensuite : /eteindre quand elle est finie). Tu recevras début, détail et rapport." ;;
+    check)       run_unit homelab-backup-check-manual /usr/local/sbin/homelab-backup-check || exit $?
+                 echo "Test d'intégrité lancé (long ; résultat par notification)." ;;
+    restoretest) run_unit homelab-backup-restoretest-manual /usr/local/sbin/homelab-backup-restoretest || exit $?
+                 echo "Test de restauration lancé." ;;
+    keep-on)     touch "$HB_STATE/keep-on"; echo "Extinction automatique désactivée (le serveur restera allumé après la sauvegarde)." ;;
+    keep-off)    rm -f "$HB_STATE/keep-on"; echo "Extinction automatique réactivée." ;;
+    poweroff|reboot)
+        systemctl is-active --quiet homelab-backup-power-action.timer && { echo "Une action est déjà programmée : /annuler."; exit 6; }
+        pgrep -f homelab-backup-run >/dev/null 2>&1 && { echo "Une sauvegarde est en cours : action refusée (attends la fin)."; exit 6; }
+        if [[ "$verb" == "poweroff" ]]; then
+            systemd-run --unit=homelab-backup-power-action --on-active="${DELAY}s" --collect --quiet /usr/local/sbin/homelab-backup-ctl poweroff
+            echo "Extinction dans ${DELAY} s ; réveil automatique programmé (alarme RTC). /annuler pour interrompre."
+        else
+            systemd-run --unit=homelab-backup-power-action --on-active="${DELAY}s" --collect --quiet systemctl reboot
+            echo "Redémarrage dans ${DELAY} s. /annuler pour interrompre."
+        fi ;;
+esac
+exit 0

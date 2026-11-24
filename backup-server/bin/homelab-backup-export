@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Export vers un disque externe : déclenché par udev quand un disque est branché.
+# Il ne se passe RIEN si le disque ne contient pas le fichier marqueur (EXPORT_MARKER) à sa racine.
+#
+# Contenu facultatif du fichier marqueur (une option par ligne) :
+#   clusters=prod,maison     (noms des sources à exporter ; plusieurs lignes possibles ; # = commentaire ;
+#                             absent ou 'all' = toutes)
+#   keep=2                   (nombre d'exports conservés par cluster sur ce disque)
+#
+# Usage : homelab-backup-export /dev/sdX1        (appelé par homelab-backup-export@.service)
+#         homelab-backup-export --dir /point/de/montage   (disque déjà monté : tests/manuel)
+set -Eeuo pipefail
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf
+
+MNT="" DEV="" OWN_MOUNT=0
+if [[ "${1:-}" == "--dir" ]]; then
+    MNT="${2:?point de montage manquant}"
+else
+    DEV="${1:?périphérique manquant}"
+    [[ "$DEV" == /dev/* ]] || DEV="/dev/$DEV"
+fi
+
+exec 8>/run/homelab-backup-export.lock
+flock -n 8 || { log "Export : un autre export est déjà en cours."; exit 0; }
+
+cleanup() {
+    if (( OWN_MOUNT )) && mountpoint -q "$MNT"; then sync; umount "$MNT" 2>/dev/null || true; rmdir "$MNT" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+
+# --- Montage prudent : lecture seule d'abord, uniquement pour chercher le marqueur ---------
+if [[ -z "$MNT" ]]; then
+    [[ -b "$DEV" ]] || exit 0
+    findmnt -rn -S "$DEV" >/dev/null 2>&1 && exit 0                  # déjà monté (ex. volume de sauvegarde)
+    fstype="$(blkid -o value -s TYPE "$DEV" 2>/dev/null || true)"
+    case "$fstype" in ""|swap|linux_raid_member|LVM2_member|zfs_member|crypto_LUKS|bcache) exit 0;; esac
+
+    uuid="$(blkid -o value -s UUID "$DEV" 2>/dev/null || true)"
+    hb_notify usb "Disque USB branché" "${DEV} : $(lsblk -dno SIZE,MODEL "$DEV" 2>/dev/null | xargs) · ${fstype} · étiquette « $(blkid -o value -s LABEL "$DEV" 2>/dev/null || true) » · UUID ${uuid:-?}. Export seulement s'il porte le fichier ${EXPORT_MARKER}."
+    if [[ -n "$EXPORT_ALLOWED_UUIDS" ]] && ! grep -qw -- "$uuid" <<<"$EXPORT_ALLOWED_UUIDS"; then
+        log "Export : disque $DEV (UUID $uuid) non autorisé (EXPORT_ALLOWED_UUIDS), ignoré."
+        exit 0
+    fi
+
+    MNT="/mnt/homelab-export"
+    mkdir -p "$MNT"
+    mountpoint -q "$MNT" && exit 0
+    mount -o ro,nosuid,nodev,noexec "$DEV" "$MNT" 2>/dev/null || { log "Export : $DEV (type ${fstype}) ne peut pas être monté (pilote absent ? NTFS : apt install ntfs-3g)."; rmdir "$MNT" 2>/dev/null || true; exit 0; }
+    OWN_MOUNT=1
+    if [[ ! -f "$MNT/$EXPORT_MARKER" ]]; then
+        exit 0                                                         # disque ordinaire : on ne touche à rien
+    fi
+    mount -o remount,rw "$MNT" || { hb_mail "[Sauvegarde] Export impossible" "Le disque $DEV ne peut pas être monté en écriture."; exit 1; }
+fi
+
+[[ -f "$MNT/$EXPORT_MARKER" ]] || { log "Export : pas de fichier $EXPORT_MARKER dans $MNT."; exit 0; }
+
+log "=== Export vers le disque externe ($MNT) ==="
+hb_notify usb "Export démarré" "Copie des sauvegardes vers ${DEV:-$MNT} : ne pas débrancher."
+mountpoint -q "${BACKUP_MOUNT:-$BACKUP_ROOT}" || { hb_mail "[Sauvegarde] Export impossible" "$BACKUP_ROOT n'est pas monté."; exit 1; }
+
+# --- Options du marqueur (lues sans les exécuter) -------------------------------------
+want="$(sed -n 's/^clusters[[:space:]]*=//p' "$MNT/$EXPORT_MARKER" | sed 's/#.*//' | tr -d '\r' | tr ',' ' ' | tr '\n' ' ')"
+keep="$(sed -n 's/^keep=//p' "$MNT/$EXPORT_MARKER" | head -n1 | tr -dc '0-9')"
+keep="${keep:-$EXPORT_KEEP}"; (( keep >= 1 )) || keep=1
+[[ -n "$want" && "$want" != "all" ]] || want="$(hb_source_names | tr '\n' ' ')"
+
+fs="$(findmnt -no FSTYPE -T "$MNT" 2>/dev/null || true)"
+case "$fs" in
+    vfat|msdos|fat)
+        hb_mail "[Sauvegarde] Export refusé : disque en FAT32" "Le disque ($fs) limite les fichiers à 4 Go : les sauvegardes ne peuvent pas y être copiées. Utilise ext4, xfs, btrfs, exFAT ou NTFS."
+        log "Export refusé : système de fichiers $fs (fichiers limités à 4 Go)."; exit 1;;
+esac
+case "$fs" in
+    ext2|ext3|ext4|xfs|btrfs|f2fs) RS=(-aHAX --numeric-ids); LINK=1;;
+    *) RS=(-rt --no-perms --no-owner --no-group --modify-window=2); LINK=0
+       log "Export : système de fichiers '$fs' sans droits Unix : permissions et propriétaires NON conservés.";;
+esac
+
+REPORT="" FAILS=0
+for c in $want; do
+    if [[ ! "$c" =~ ^[A-Za-z0-9._-]+$ || ! -d "$BACKUP_ROOT/$c/snaps" ]]; then
+        REPORT+="[$c] source inconnue, ignorée."$'\n'; continue
+    fi
+    snap="$(hb_snap_valid_list "$c" | tail -n1)"
+    if [[ -z "$snap" ]]; then REPORT+="[$c] aucun instantané valide à exporter."$'\n'; FAILS=$(( FAILS + 1 )); continue; fi
+    if [[ -f "$HB_STATE/$c.alert" ]]; then
+        REPORT+="[$c] ⚠ une alerte n'est pas acquittée : l'export utilise le dernier instantané VALIDÉ ($snap)."$'\n'
+    fi
+
+    dest="$MNT/homelab-backup/$c"
+    mkdir -p "$dest"
+    # exports incomplets d'une tentative précédente
+    for d in "$dest"/*/; do [[ -d "$d" && ! -f "${d}.export-complete" ]] && rm -rf "$d"; done
+
+    if [[ -f "$dest/$snap/.export-complete" ]]; then
+        REPORT+="[$c] $snap déjà présent sur ce disque."$'\n'
+    else
+        prev="$(find "$dest" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tail -n1)"
+        opts=("${RS[@]}")
+        (( LINK )) && [[ -n "$prev" ]] && opts+=(--link-dest="$dest/$prev")
+        if rsync "${opts[@]}" "$BACKUP_ROOT/$c/snaps/$snap/" "$dest/$snap/" >>"$HB_LOG" 2>&1; then
+            date -Is > "$dest/$snap/.export-complete"
+            REPORT+="[$c] exporté : $snap."$'\n'
+        else
+            REPORT+="[$c] ÉCHEC de la copie ($snap) : disque plein ? voir $HB_LOG."$'\n'
+            rm -rf "${dest:?}/$snap"
+            FAILS=$(( FAILS + 1 ))
+            continue
+        fi
+    fi
+
+    # Rotation sur le disque externe
+    mapfile -t ex < <(find "$dest" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+    if (( ${#ex[@]} > keep )); then
+        for (( i = 0; i < ${#ex[@]} - keep; i++ )); do rm -rf "${dest:?}/${ex[i]}"; done
+    fi
+done
+
+REPORT+="Espace libre sur le disque : $(df -h --output=avail "$MNT" | tail -n1 | xargs)"$'\n'
+sync
+if (( FAILS )); then
+    hb_mail "[Sauvegarde] Export disque externe : ÉCHEC" "$REPORT"
+    hb_notify alert "Export USB : ÉCHEC" "$REPORT"
+else
+    hb_mail "[Sauvegarde] Export terminé : tu peux débrancher le disque" "$REPORT"
+    hb_notify usb "Export terminé : tu peux débrancher le disque" "$REPORT"
+fi
+log "$REPORT"

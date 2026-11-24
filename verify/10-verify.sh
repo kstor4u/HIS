@@ -34,7 +34,7 @@ verify_docker_apps() {
 
     info "Vérification des stacks Docker..."
 
-    local -a apps=(nextcloud syncin immich homeassistant jellyfin)
+    local -a apps=(nextcloud syncin immich homeassistant jellyfin collabora onlyoffice)
     local app
 
     for app in "${apps[@]}"; do
@@ -44,6 +44,8 @@ verify_docker_apps() {
             immich) [[ "$ENABLE_IMMICH" == "true" ]] || continue ;;
             homeassistant) [[ "$ENABLE_HOMEASSISTANT" == "true" ]] || continue ;;
             jellyfin) [[ "$ENABLE_JELLYFIN" == "true" ]] || continue ;;
+            collabora) [[ "$ENABLE_COLLABORA" == "true" ]] || continue ;;
+            onlyoffice) [[ "$ENABLE_ONLYOFFICE" == "true" ]] || continue ;;
         esac
 
         if ! qm guest exec "$DOCKER_ID" -- bash -c "cd /opt/apps/${app} && docker compose ps --status running --format '{{.Name}}' | grep -q ." >/dev/null 2>&1; then
@@ -98,6 +100,9 @@ verify_installation() {
     pvesh get \
         "/cluster/mapping/dir/${VIRTIOFS_DIR_ID}" \
         --output-format json
+    pvesh get \
+        "/cluster/mapping/dir/${APPS_VIRTIOFS_DIR_ID}" \
+        --output-format json
 
     if [[ "$ENABLE_FILES" == "true" ]]; then
 
@@ -147,6 +152,40 @@ verify_installation() {
 
         info "CT WIREGUARD :"
         pct config "$WG_ID"
+    fi
+
+    if [[ "$ENABLE_MAIL" == "true" ]]; then
+
+        echo
+        info "CT MAIL :"
+        pct config "$MAIL_ID"
+    fi
+
+    if [[ "$ENABLE_AI" == "true" ]]; then
+
+        echo
+        verify_ai
+    fi
+
+    if [[ "$ENABLE_MONITOR" == "true" ]]; then
+
+        echo
+        info "CT MONITOR :"
+        pct config "$MONITOR_ID"
+    fi
+
+    if [[ "$ENABLE_DNS" == "true" ]]; then
+
+        echo
+        info "CT DNS :"
+        pct config "$DNS_ID"
+    fi
+
+    if [[ "$ENABLE_NODE" == "true" ]]; then
+
+        echo
+        info "CT NODE :"
+        pct config "$NODE_ID"
     fi
 
     if [[ "$ENABLE_XMRIG" == "true" ]]; then

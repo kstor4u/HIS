@@ -19,6 +19,12 @@ users:
     lock_passwd: false
     passwd: ${ROOT_PASSWORD_HASH}
 
+# Swap de 2 Go : filet de sécurité contre les pics de mémoire (sans lui, la VM gèle au lieu de ralentir).
+swap:
+  filename: /swapfile
+  size: 2147483648
+  maxsize: 2147483648
+
 package_update: true
 
 packages:
@@ -28,6 +34,13 @@ packages:
   - gnupg
 
 write_files:
+
+  # Rotation des journaux des conteneurs : sans elle, un conteneur bavard remplit le disque de la VM.
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: '0644'
+    content: |
+      {"log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}}
 
   - path: /usr/local/sbin/install-docker.sh
     owner: root:root
@@ -95,7 +108,13 @@ write_files:
               "\${SHARED_GROUP}"
       fi
 
-      mkdir -p "\${MOUNT_POINT}"
+      mkdir -p "\${MOUNT_POINT}" "${DOCKER_APPS_MOUNT}"
+
+      # 2e VirtioFS : données d'applications hors de SHARED (Immich).
+      if ! grep -q "${DOCKER_APPS_MOUNT}" /etc/fstab; then
+
+          printf '${APPS_VIRTIOFS_DIR_ID} ${DOCKER_APPS_MOUNT} virtiofs defaults,_netdev,nofail 0 0\n' >> /etc/fstab
+      fi
 
       if ! grep -q "\${MOUNT_POINT}" /etc/fstab; then
 
@@ -114,6 +133,8 @@ write_files:
           fi
       done
 
+      mountpoint -q "${DOCKER_APPS_MOUNT}" || mount "${DOCKER_APPS_MOUNT}" || true
+
       if ! mountpoint -q "\${MOUNT_POINT}"; then
           echo "AVERTISSEMENT: \${MOUNT_POINT} non monté (normal au tout premier boot). Le montage réel aura lieu après le redémarrage prévu par le script d'installation." >&2
       fi
@@ -123,8 +144,43 @@ write_files:
           /opt/apps/syncin \
           /opt/apps/immich \
           /opt/apps/homeassistant \
-          /opt/apps/jellyfin
+          /opt/apps/jellyfin \
+          /opt/apps/collabora \
+          /opt/apps/onlyoffice
 EOF
+
+    # Nextcloud joint les serveurs de documents par leur nom public ; sans cela le trafic
+    # repasserait par l'IP publique de la box (retour en boucle souvent impossible).
+    # On force ces noms vers SWAG, sur le réseau privé.
+    local NC_EXTRA_HOSTS=""
+    if [[ "${SYNCIN_ONLYOFFICE:-false}" == "true" && "${ENABLE_ONLYOFFICE:-false}" != "true" ]]; then
+        warn "SYNCIN_ONLYOFFICE=true ignoré : ENABLE_ONLYOFFICE=true est requis (Sync-in utilise le serveur OnlyOffice)."
+    fi
+    if [[ "${SYNCIN_COLLABORA:-false}" == "true" && "${ENABLE_COLLABORA:-false}" != "true" ]]; then
+        warn "SYNCIN_COLLABORA=true ignoré : ENABLE_COLLABORA=true est requis (Sync-in utilise le serveur Collabora)."
+    fi
+
+    if [[ "$ENABLE_COLLABORA" == "true" ]]; then
+        NC_EXTRA_HOSTS+="            - \"${COLLABORA_SUBDOMAIN}.${DOMAIN}:${SWAG_IP%%/*}\""$'\n'
+    fi
+
+    if [[ "$ENABLE_ONLYOFFICE" == "true" ]]; then
+        NC_EXTRA_HOSTS+="            - \"${ONLYOFFICE_SUBDOMAIN}.${DOMAIN}:${SWAG_IP%%/*}\""$'\n'
+    fi
+
+    [[ -z "$NC_EXTRA_HOSTS" ]] || NC_EXTRA_HOSTS="          extra_hosts:"$'\n'"${NC_EXTRA_HOSTS%$'\n'}"
+
+    local nb_apps=0 v
+    for v in ENABLE_NEXTCLOUD ENABLE_SYNCIN ENABLE_IMMICH ENABLE_JELLYFIN ENABLE_HOMEASSISTANT ENABLE_ARR; do
+        [[ "${!v:-false}" == "true" ]] && nb_apps=$((nb_apps + 1))
+    done
+    if (( nb_apps >= 3 && ${DOCKER_MEMORY:-0} < 6144 )); then
+        warn "DOCKER_MEMORY=${DOCKER_MEMORY} Mo est trop juste pour ${nb_apps} applications Docker : la VM risque de geler (manque de mémoire). Visez 8192 (modifiable ensuite : qm set ${DOCKER_ID} --memory 8192)."
+    fi
+
+    if [[ "$ENABLE_ONLYOFFICE" == "true" && "${DOCKER_MEMORY:-0}" -lt 6144 ]]; then
+        warn "OnlyOffice demande environ 4 Go de RAM en plus des autres applications : DOCKER_MEMORY=${DOCKER_MEMORY} est probablement insuffisant (visez 8192)."
+    fi
 
     if [[ "$ENABLE_NEXTCLOUD" == "true" ]]; then
 
@@ -166,15 +222,17 @@ EOF
             - POSTGRES_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
             - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
             - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
-            - NEXTCLOUD_TRUSTED_DOMAINS=cloud.${DOMAIN} ${DOCKER_IP%%/*} ${LAN_IP}
+            - NEXTCLOUD_TRUSTED_DOMAINS=$(sd_fqdns NEXTCLOUD_SUBDOMAIN) ${DOCKER_IP%%/*} ${LAN_IP}
             - TRUSTED_PROXIES=${SWAG_IP%%/*}
-            - NEXTCLOUD_DATA_DIR=${DOCKER_SHARED_MOUNT}/${APPS_DATA_SUBDIR}/nextcloud
+            - NEXTCLOUD_DATA_DIR=${DOCKER_APPS_MOUNT}/nextcloud
             - TZ=Europe/Paris
           volumes:
             - nextcloud_html:/var/www/html
             - ${DOCKER_SHARED_MOUNT}:${DOCKER_SHARED_MOUNT}:rw
+            - ${DOCKER_APPS_MOUNT}/nextcloud:${DOCKER_APPS_MOUNT}/nextcloud:rw
           group_add:
             - "${SHARED_GID}"
+${NC_EXTRA_HOSTS}
           ports:
             - "${NEXTCLOUD_HTTP_PORT}:80"
 
@@ -197,20 +255,7 @@ EOF
     owner: root:root
     permissions: '0644'
     content: |
-      # Schéma Sync-in v2 : mysql.url, auth.encryptionKey, auth.token.*,
-      # applications.files.dataPath (cf. environment.dist.yaml du projet).
-      mysql:
-        url: mysql://syncin:${SYNCIN_DB_PASSWORD}@syncin-db:3306/syncin
-      auth:
-        encryptionKey: ${SYNCIN_SECRET_1}
-        token:
-          access:
-            secret: ${SYNCIN_SECRET_2}
-          refresh:
-            secret: ${SYNCIN_SECRET_3}
-      applications:
-        files:
-          dataPath: /app/data
+$(syncin_environment_text | sed 's/^/      /')
 
   - path: /opt/apps/syncin/docker-compose.yml
     owner: root:root
@@ -253,14 +298,15 @@ EOF
             - TZ=Europe/Paris
           volumes:
             - /opt/apps/syncin/environment.yaml:/app/environment/environment.yaml:ro
-            # Données internes de Sync-in (users/spaces/tmp) : sur SHARED, dans un dossier caché.
-            - ${DOCKER_SHARED_MOUNT}/${APPS_DATA_SUBDIR}/syncin:/app/data
+            # Données internes de Sync-in (users/spaces/tmp) : hors SHARED (VirtioFS apps_data).
+            - ${DOCKER_APPS_MOUNT}/syncin:/app/data
             # SHARED visible dans le conteneur au même chemin que partout :
             # dans Sync-in (Admin > Spaces > racine externe), utiliser
-            # ${DOCKER_SHARED_MOUNT}/Family, /Photo, /Movies, /Music.
+            # ${DOCKER_SHARED_MOUNT}/Users, /Photo, /Movies, /Music.
             - ${DOCKER_SHARED_MOUNT}:${DOCKER_SHARED_MOUNT}:rw
           group_add:
             - "${SHARED_GID}"
+$(syncin_extra_hosts_cloudinit)
           ports:
             - "${SYNCIN_HTTP_PORT}:8080"
 
@@ -300,7 +346,7 @@ EOF
             - TZ=Europe/Paris
           volumes:
             # Les versions actuelles d'Immich lisent/écrivent UNIQUEMENT dans /data.
-            - ${DOCKER_SHARED_MOUNT}/${IMMICH_UPLOAD_SUBDIR}:/data
+            - ${DOCKER_APPS_MOUNT}/immich:/data
             - ${DOCKER_SHARED_MOUNT}/Photo:/mnt/external/photo:rw
             - /etc/localtime:/etc/localtime:ro
           group_add:
@@ -312,6 +358,7 @@ EOF
           image: ghcr.io/immich-app/immich-machine-learning:release
           container_name: immich-ml
           restart: unless-stopped
+$(immich_ml_env)
           volumes:
             - immich_model_cache:/cache
 
@@ -411,6 +458,71 @@ EOF
 EOF
     fi
 
+    if [[ "$ENABLE_COLLABORA" == "true" ]]; then
+
+        cat >> "$SNIPPET" <<EOF
+
+  - path: /opt/apps/collabora/docker-compose.yml
+    owner: root:root
+    permissions: '0600'
+    content: |
+      name: collabora
+      services:
+        collabora:
+          image: collabora/code:latest
+          container_name: collabora
+          restart: unless-stopped
+          cap_add:
+            - MKNOD
+          environment:
+            - aliasgroup1=https://${NEXTCLOUD_SUBDOMAIN}.${DOMAIN}:443
+$(collabora_syncin_alias_cloudinit)
+            - server_name=${COLLABORA_SUBDOMAIN}.${DOMAIN}
+            - dictionaries=${COLLABORA_DICTIONARIES}
+            - extra_params=--o:ssl.enable=false --o:ssl.termination=true
+          extra_hosts:
+            - "${NEXTCLOUD_SUBDOMAIN}.${DOMAIN}:${SWAG_IP%%/*}"
+$(collabora_syncin_hosts_cloudinit)
+          ports:
+            - "${COLLABORA_HTTP_PORT}:9980"
+EOF
+    fi
+
+    if [[ "$ENABLE_ONLYOFFICE" == "true" ]]; then
+
+        cat >> "$SNIPPET" <<EOF
+
+  - path: /opt/apps/onlyoffice/docker-compose.yml
+    owner: root:root
+    permissions: '0600'
+    content: |
+      name: onlyoffice
+      services:
+        onlyoffice:
+          image: onlyoffice/documentserver:latest
+          container_name: onlyoffice
+          restart: unless-stopped
+          environment:
+            - JWT_ENABLED=true
+            - JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
+            - ALLOW_PRIVATE_IP_ADDRESS=true
+          extra_hosts:
+            - "${NEXTCLOUD_SUBDOMAIN}.${DOMAIN}:${SWAG_IP%%/*}"
+$(onlyoffice_syncin_hosts_cloudinit)
+          volumes:
+            - onlyoffice_data:/var/www/onlyoffice/Data
+            - onlyoffice_logs:/var/log/onlyoffice
+            - onlyoffice_lib:/var/lib/onlyoffice
+          ports:
+            - "${ONLYOFFICE_HTTP_PORT}:80"
+
+      volumes:
+        onlyoffice_data:
+        onlyoffice_logs:
+        onlyoffice_lib:
+EOF
+    fi
+
     cat >> "$SNIPPET" <<EOF
 
 runcmd:
@@ -437,6 +549,152 @@ nextcloud_occ() {
     jq -r '.["out-data"] // empty, .["err-data"] // empty' <<< "$raw" 2>/dev/null || printf '%s\n' "$raw"
 }
 
+# Attend que Nextcloud soit réellement installé : test HTTP (status.php) puis occ. Affiche la raison si ça échoue.
+# Retourne 0 si prêt, 1 sinon.
+nextcloud_wait_ready() {
+
+    local VMID="${1:-$DOCKER_ID}" attempt st="" occ_out="" url="http://${DOCKER_IP%%/*}:${NEXTCLOUD_HTTP_PORT}/status.php"
+
+    for ((attempt = 1; attempt <= 60; attempt++)); do
+        st="$(curl -fsS --max-time 8 "$url" 2>/dev/null || true)"
+        grep -q '"installed":true' <<< "$st" && break
+        sleep 10
+    done
+
+    if ! grep -q '"installed":true' <<< "$st"; then
+        if [[ -z "$st" ]]; then
+            warn "Nextcloud ne répond pas sur ${url} (conteneur arrêté ? VM gelée ? : qm status ${VMID})."
+        else
+            warn "Nextcloud répond mais n'est PAS installé (status.php : \"installed\":false) : l'installation automatique a échoué (ancienne base/dossier de données ?)."
+            warn "Pour repartir de zéro (supprime la config, la base et les fichiers propres à Nextcloud, pas SHARED) : ./install.sh --run nextcloud_reinstall force"
+        fi
+        return 1
+    fi
+
+    for ((attempt = 1; attempt <= 6; attempt++)); do
+        occ_out="$(nextcloud_occ "$VMID" status)"
+        grep -q 'installed: true' <<< "$occ_out" && return 0
+        sleep 10
+    done
+
+    warn "Nextcloud est installé mais « occ » échoue ; sortie :"
+    printf '%s\n' "$occ_out" | head -n 8 >&2
+    return 1
+}
+
+# Configure Nextcloud pour utiliser Collabora et/ou OnlyOffice (applications
+# "richdocuments" / "onlyoffice"). Idempotent. Non bloquant : si un serveur de
+# documents n'est pas encore joignable en HTTPS (DNS, certificat SWAG), les
+# réglages sont enregistrés et la vérification se refait avec :
+#   ./install.sh --run configure_nextcloud_office
+configure_nextcloud_office() {
+
+    local VMID="${1:-$DOCKER_ID}" out
+
+    [[ "$ENABLE_NEXTCLOUD" == "true" ]] || return 0
+    [[ "$ENABLE_COLLABORA" == "true" || "$ENABLE_ONLYOFFICE" == "true" ]] || return 0
+
+    info "Nextcloud : configuration des serveurs de documents (attente de la fin d'installation)..."
+
+    nextcloud_wait_ready "$VMID" || { warn "Nextcloud pas prêt : relance ./install.sh --run configure_nextcloud_office quand il l'est."; return 0; }
+
+    # Les serveurs de documents sont joints via SWAG sur le réseau privé : sans cette
+    # option Nextcloud refuse les adresses locales.
+    nextcloud_occ "$VMID" config:system:set allow_local_remote_servers --value=true --type=boolean > /dev/null
+
+    if [[ "$ENABLE_COLLABORA" == "true" ]]; then
+
+        out="$(nextcloud_occ "$VMID" app:install richdocuments 2>&1 || true)"
+        nextcloud_occ "$VMID" app:enable richdocuments > /dev/null || true
+        nextcloud_occ "$VMID" config:app:set richdocuments wopi_url --value="https://${COLLABORA_SUBDOMAIN}.${DOMAIN}" > /dev/null
+        nextcloud_occ "$VMID" config:app:set richdocuments public_wopi_url --value="https://${COLLABORA_SUBDOMAIN}.${DOMAIN}" > /dev/null
+        nextcloud_occ "$VMID" richdocuments:activate-config 2>&1 | tail -n 2 || true
+        info "Nextcloud : Collabora configuré (https://${COLLABORA_SUBDOMAIN}.${DOMAIN})."
+    fi
+
+    if [[ "$ENABLE_ONLYOFFICE" == "true" ]]; then
+
+        out="$(nextcloud_occ "$VMID" app:install onlyoffice 2>&1 || true)"
+        nextcloud_occ "$VMID" app:enable onlyoffice > /dev/null || true
+        nextcloud_occ "$VMID" config:app:set onlyoffice DocumentServerUrl --value="https://${ONLYOFFICE_SUBDOMAIN}.${DOMAIN}/" > /dev/null
+        nextcloud_occ "$VMID" config:app:set onlyoffice DocumentServerInternalUrl --value="https://${ONLYOFFICE_SUBDOMAIN}.${DOMAIN}/" > /dev/null
+        nextcloud_occ "$VMID" config:app:set onlyoffice StorageUrl --value="https://${NEXTCLOUD_SUBDOMAIN}.${DOMAIN}/" > /dev/null
+        nextcloud_occ "$VMID" config:app:set onlyoffice jwt_secret --value="${ONLYOFFICE_JWT_SECRET}" > /dev/null
+        nextcloud_occ "$VMID" config:app:set onlyoffice jwt_header --value="Authorization" > /dev/null
+        info "Nextcloud : OnlyOffice configuré (https://${ONLYOFFICE_SUBDOMAIN}.${DOMAIN})."
+    fi
+
+    if [[ "$ENABLE_COLLABORA" == "true" && "$ENABLE_ONLYOFFICE" == "true" ]]; then
+        info "Collabora ET OnlyOffice sont actifs : pour tester un seul éditeur à la fois -> ./install.sh --run nextcloud_office_use collabora|onlyoffice"
+    fi
+}
+
+# Choisit l'éditeur de documents actif dans Nextcloud (pour comparer) :
+#   ./install.sh --run nextcloud_office_use collabora | onlyoffice | both | none
+nextcloud_office_use() {
+
+    local choice="${1:-}" VMID="${DOCKER_ID}"
+
+    case "$choice" in
+        collabora)
+            nextcloud_occ "$VMID" app:enable richdocuments > /dev/null
+            nextcloud_occ "$VMID" app:disable onlyoffice > /dev/null || true ;;
+        onlyoffice)
+            nextcloud_occ "$VMID" app:enable onlyoffice > /dev/null
+            nextcloud_occ "$VMID" app:disable richdocuments > /dev/null || true ;;
+        both)
+            nextcloud_occ "$VMID" app:enable richdocuments > /dev/null || true
+            nextcloud_occ "$VMID" app:enable onlyoffice > /dev/null || true ;;
+        none)
+            nextcloud_occ "$VMID" app:disable richdocuments > /dev/null || true
+            nextcloud_occ "$VMID" app:disable onlyoffice > /dev/null || true ;;
+        *) die "Usage : nextcloud_office_use collabora|onlyoffice|both|none" ;;
+    esac
+
+    info "Nextcloud : éditeur de documents -> ${choice}."
+    nextcloud_occ "$VMID" app:list --enabled 2>/dev/null | grep -E "richdocuments|onlyoffice" || true
+}
+
+# Repart d'une installation Nextcloud vierge quand l'assistant web s'affiche ("installed":false)
+# alors que la base et/ou le dossier de données d'une ancienne installation existent encore
+# (config.php perdu : le nouvel install échoue sur les tables et le dossier déjà remplis).
+#   ./install.sh --run nextcloud_reinstall           contrôle seulement, ne supprime rien si des données existent
+#   ./install.sh --run nextcloud_reinstall force     SUPPRIME config + base + fichiers propres à Nextcloud
+# Les stockages externes (SHARED : Users, Photo, Movies, Music) ne sont JAMAIS touchés :
+# seul ${DOCKER_APPS_MOUNT}/nextcloud (fichiers créés dans l'interface Nextcloud) est vidé.
+nextcloud_reinstall() {
+
+    local VMID="$DOCKER_ID" force=false a n
+    for a in "$@"; do
+        case "$a" in
+            force | --force) force=true ;;
+            *) VMID="$a" ;;
+        esac
+    done
+
+    [[ "$ENABLE_NEXTCLOUD" == "true" ]] || die "Nextcloud n'est pas activé."
+
+    n="$(qm guest exec "$VMID" --timeout 60 -- bash -c "find ${DOCKER_APPS_MOUNT}/nextcloud -mindepth 1 2>/dev/null | wc -l" \
+        | jq -r '.["out-data"] // "0"' 2>/dev/null | tr -d '[:space:]')"
+
+    if [[ "$force" != "true" ]]; then
+        die "Le dossier ${DOCKER_APPS_MOUNT}/nextcloud contient ${n:-?} élément(s) et la base Nextcloud existe peut-être encore. Si tu acceptes de PERDRE ce qui a été créé dans l'interface Nextcloud (comptes, fichiers propres à Nextcloud) : ./install.sh --run nextcloud_reinstall force   (les dossiers SHARED ne sont pas touchés)."
+    fi
+
+    warn "Nextcloud : réinitialisation complète (config, base PostgreSQL, ${DOCKER_APPS_MOUNT}/nextcloud). SHARED n'est pas touché."
+
+    qm guest exec "$VMID" --timeout 300 -- bash -c "
+        cd /opt/apps/nextcloud || exit 1
+        docker compose down
+        docker volume rm nextcloud_nextcloud_html nextcloud_nextcloud_db 2>/dev/null || true
+        find ${DOCKER_APPS_MOUNT}/nextcloud -mindepth 1 -delete
+        docker compose up -d" \
+        || die "Relance de la stack Nextcloud échouée (qm guest exec ${VMID} -- docker compose -f /opt/apps/nextcloud/docker-compose.yml logs)."
+
+    configure_nextcloud_external_storage "$VMID"
+    nextcloud_post_install || true
+}
+
 # Connecte Nextcloud aux sous-dossiers de SHARED (stockages externes
 # "local"). Idempotent : un montage déjà présent n'est pas recréé ni
 # modifié (les droits ajustés ensuite dans l'interface sont conservés).
@@ -449,13 +707,17 @@ configure_nextcloud_external_storage() {
     local attempt out folder mount_list storage_id
     local ready=false
 
-    info "Attente de la fin d'installation de Nextcloud (occ status)..."
+    local url="http://${DOCKER_IP%%/*}:${NEXTCLOUD_HTTP_PORT}/status.php" st="" last_occ=""
 
+    info "Attente de la fin d'installation de Nextcloud (test HTTP ${url})..."
+
+    # Test HTTP (status.php) : léger et fiable dès que l'interface répond. L'ancien test
+    # "occ status" pouvait rester bloqué alors que l'interface fonctionnait déjà.
     for ((attempt = 1; attempt <= 60; attempt++)); do
 
-        out="$(nextcloud_occ "$VMID" status)"
+        st="$(curl -fsS --max-time 8 "$url" 2>/dev/null || true)"
 
-        if grep -q 'installed: true' <<< "$out"; then
+        if grep -q '"installed":true' <<< "$st"; then
             ready=true
             break
         fi
@@ -463,8 +725,30 @@ configure_nextcloud_external_storage() {
         sleep 10
     done
 
+    if [[ "$ready" == "true" ]]; then
+        # L'interface répond : vérifie aussi que occ fonctionne (les stockages externes l'utilisent).
+        for ((attempt = 1; attempt <= 6; attempt++)); do
+            last_occ="$(nextcloud_occ "$VMID" status)"
+            grep -q 'installed: true' <<< "$last_occ" && break
+            ready=false
+            sleep 10
+        done
+        grep -q 'installed: true' <<< "$last_occ" && ready=true
+    fi
+
     if [[ "$ready" != "true" ]]; then
-        warn "Nextcloud n'a pas fini son installation après 10 min : stockages externes non configurés. Relance-les plus tard avec : qm guest exec ${VMID} -- docker exec -u www-data nextcloud php occ files_external:list"
+        if [[ -z "$last_occ" ]]; then
+            warn "Nextcloud répond mais n'est PAS installé (status.php : \"installed\":false) : l'installation automatique a échoué."
+            warn "Derniers messages du conteneur nextcloud :"
+            qm guest exec "$VMID" --timeout 60 -- bash -c "docker logs --tail 25 nextcloud 2>&1; echo '--- droits du dossier de données :'; ls -lan ${DOCKER_APPS_MOUNT}/nextcloud | head -8" 2>&1 \
+                | jq -r '.["out-data"] // empty, .["err-data"] // empty' 2>/dev/null | head -n 40 >&2 || true
+            warn "Piste : droits/contenu de ${DOCKER_APPS_MOUNT}/nextcloud (doit appartenir à l'uid 33), ou reste d'une installation avortée. Si c'est une ancienne installation incomplète : ./install.sh --run nextcloud_reinstall force"
+        fi
+        if [[ -n "$last_occ" ]]; then
+            warn "Nextcloud répond en HTTP mais « occ status » échoue ; sortie de occ :"
+            printf '%s\n' "$last_occ" | head -n 10 >&2
+        fi
+        warn "Nextcloud : stockages externes non configurés. Relance-les plus tard avec : ./install.sh --run configure_nextcloud_external_storage ${VMID}  (test manuel : qm guest exec ${VMID} -- docker exec -u www-data nextcloud php occ status)"
         return 0
     fi
 
@@ -474,7 +758,7 @@ configure_nextcloud_external_storage() {
 
     mount_list="$(nextcloud_occ "$VMID" files_external:list)"
 
-    for folder in Family Photo Movies Music; do
+    for folder in Users Photo Movies Music; do
 
         if grep -q "/${folder} " <<< "$mount_list"; then
             info "Nextcloud : stockage externe /${folder} déjà présent."
@@ -557,6 +841,26 @@ start_docker_apps() {
         fi
     fi
 
+    if [[ "$ENABLE_COLLABORA" == "true" ]]; then
+
+        info "Démarrage de Collabora Online..."
+
+        if ! timeout 1800 qm guest exec "$VMID" -- bash -c "cd /opt/apps/collabora && docker compose up -d"; then
+            warn "Échec du démarrage de Collabora. Vérifie : qm guest exec ${VMID} -- docker compose -f /opt/apps/collabora/docker-compose.yml logs"
+        fi
+    fi
+
+    if [[ "$ENABLE_ONLYOFFICE" == "true" ]]; then
+
+        info "Démarrage d'OnlyOffice Document Server (démarrage lent, plusieurs minutes)..."
+
+        if ! timeout 1800 qm guest exec "$VMID" -- bash -c "cd /opt/apps/onlyoffice && docker compose up -d"; then
+            warn "Échec du démarrage d'OnlyOffice. Vérifie : qm guest exec ${VMID} -- docker compose -f /opt/apps/onlyoffice/docker-compose.yml logs"
+        fi
+    fi
+
+    configure_nextcloud_office "$VMID" || warn "Configuration Nextcloud des serveurs de documents incomplète : ./install.sh --run configure_nextcloud_office"
+
     if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
 
         info "Démarrage de Jellyfin..."
@@ -590,8 +894,9 @@ verify_docker_shared_storage() {
         raw="$(qm guest exec "$VMID" -- bash -c '
             set -e
             mountpoint -q /srv/data
+            mountpoint -q '"${DOCKER_APPS_MOUNT}"'
             getent group fileshare | grep -q ":2000:"
-            test -d /srv/data/Family
+            test -d /srv/data/Users
             test -d /srv/data/Photo
             test -d /srv/data/Movies
             test -d /srv/data/Music
@@ -615,7 +920,7 @@ create_docker_vm() {
 
     create_docker_cloud_init
 
-    create_cloud_vm \
+    VM_CPU_TYPE="$DOCKER_CPU_TYPE" create_cloud_vm \
         "$DOCKER_ID" \
         "$DOCKER_HOSTNAME" \
         "$DOCKER_CORES" \
@@ -628,7 +933,8 @@ create_docker_vm() {
     info "Configuration VirtioFS de la VM ${DOCKER_ID}..."
 
     qm set "$DOCKER_ID" \
-        --virtiofs0 "dirid=${VIRTIOFS_DIR_ID},cache=auto,expose-acl=1"
+        --virtiofs0 "dirid=${VIRTIOFS_DIR_ID},cache=auto,expose-acl=1" \
+        --virtiofs1 "dirid=${APPS_VIRTIOFS_DIR_ID},cache=auto"
 
     if qm status "$DOCKER_ID" |
         grep -q "status: running"; then

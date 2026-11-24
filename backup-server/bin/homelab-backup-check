@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Contrôle mensuel : (1) vérification du RAID / système de fichiers (scrub), (2) intégrité des
+# sauvegardes (lecture de tous les fichiers du miroir et comparaison aux empreintes mémorisées).
+# Appelé par homelab-backup-run quand le dernier contrôle complet date de CHECK_INTERVAL_DAYS jours,
+# ou à la main : homelab-backup-ctl check. Reprend là où il s'est arrêté si CHECK_MAX_H est dépassé.
+#
+# Sortie : lignes de compte rendu sur stdout. Code : 0 = tout va bien, 1 = problème, 2 = incomplet.
+set -Eeuo pipefail
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf
+
+VERIFY="${HB_VERIFY:-/usr/local/lib/homelab-backup/verify.py}"
+MD_SYSFS="${MD_SYSFS:-/sys/block}"
+START=$(date +%s)
+DEADLINE=$(( START + CHECK_MAX_H * 3600 ))
+PROBLEMS=0
+INCOMPLETE=0
+OUT=""
+say() { echo "$*"; OUT+="$*"$'\n'; }
+
+time_left() { echo $(( DEADLINE - $(date +%s) )); }
+
+# --- 1. RAID / système de fichiers --------------------------------------------------------
+# Détection d'après le périphérique qui porte BACKUP_ROOT : mdadm, ZFS, btrfs. Sinon : rien à faire.
+scrub_md() {
+    local dev="$1" md; md="$(basename "$dev")"
+    local base="$MD_SYSFS/$md/md"
+    [[ -d "$base" ]] || { say "RAID : $md introuvable dans sysfs, contrôle ignoré."; return 0; }
+
+    local state_file="$HB_STATE/scrub-md.pos" pos=0
+    local action; action="$(cat "$base/sync_action")"
+    if [[ "$action" != "idle" ]]; then
+        say "RAID $md : une opération est déjà en cours ($action), on attend sa fin."
+    else
+        [[ -f "$state_file" ]] && pos="$(cat "$state_file")"
+        echo "$pos" > "$base/sync_min" 2>/dev/null || true
+        echo check > "$base/sync_action"
+        say "RAID $md : vérification lancée$( (( pos > 0 )) && echo " (reprise au secteur $pos)")."
+    fi
+
+    while [[ "$(cat "$base/sync_action")" != "idle" ]]; do
+        if (( $(time_left) <= 0 )); then
+            local done_s; done_s="$(cut -d' ' -f1 "$base/sync_completed" 2>/dev/null | grep -E '^[0-9]+$' || echo 0)"
+            echo idle > "$base/sync_action"
+            echo "$done_s" > "$state_file"
+            say "RAID $md : durée maximale atteinte, vérification interrompue au secteur $done_s (reprise au prochain démarrage)."
+            INCOMPLETE=1
+            return 0
+        fi
+        sleep "${CHECK_POLL_S:-60}"
+    done
+
+    rm -f "$state_file"
+    echo 0 > "$base/sync_min" 2>/dev/null || true
+    local mm; mm="$(cat "$base/mismatch_cnt" 2>/dev/null || echo 0)"
+    if (( mm > 0 )); then
+        say "⚠ RAID $md : $mm secteur(s) incohérent(s) entre les disques."
+        PROBLEMS=1
+    else
+        say "RAID $md : vérification terminée, aucune incohérence."
+    fi
+    grep -qE '\[[U_]*_[U_]*\]' /proc/mdstat 2>/dev/null && { say "⚠ RAID $md dégradé (voir /proc/mdstat)."; PROBLEMS=1; }
+    return 0
+}
+
+scrub_zfs() {
+    local pool="$1" st
+    st="$(zpool status "$pool" 2>/dev/null || true)"
+    if grep -q "scrub in progress" <<<"$st"; then :; else zpool scrub "$pool" 2>/dev/null || zpool scrub -w "$pool" 2>/dev/null || true; fi
+    say "ZFS $pool : scrub lancé."
+    while zpool status "$pool" 2>/dev/null | grep -q "scrub in progress"; do
+        if (( $(time_left) <= 0 )); then
+            zpool scrub -p "$pool" >/dev/null 2>&1 || true
+            say "ZFS $pool : durée maximale atteinte, scrub mis en pause (reprise au prochain démarrage)."
+            INCOMPLETE=1; return 0
+        fi
+        sleep "${CHECK_POLL_S:-60}"
+    done
+    st="$(zpool status "$pool" 2>/dev/null || true)"
+    if grep -qE "errors: No known data errors" <<<"$st" && grep -q "state: ONLINE" <<<"$st"; then
+        say "ZFS $pool : scrub terminé, aucune erreur."
+    else
+        say "⚠ ZFS $pool : problème détecté :"; echo "$st" | sed -n '1,20p'; PROBLEMS=1
+    fi
+}
+
+scrub_btrfs() {
+    local mnt="$1" st
+    st="$(btrfs scrub status "$mnt" 2>/dev/null || true)"
+    if grep -q "Status:.*running" <<<"$st"; then :; elif grep -q "Status:.*\(aborted\|interrupted\)" <<<"$st"; then btrfs scrub resume "$mnt" >/dev/null 2>&1 || true
+    else btrfs scrub start "$mnt" >/dev/null 2>&1 || true; fi
+    say "btrfs $mnt : scrub lancé."
+    while btrfs scrub status "$mnt" 2>/dev/null | grep -q "Status:.*running"; do
+        if (( $(time_left) <= 0 )); then
+            btrfs scrub cancel "$mnt" >/dev/null 2>&1 || true
+            say "btrfs $mnt : durée maximale atteinte, scrub interrompu (reprise au prochain démarrage)."
+            INCOMPLETE=1; return 0
+        fi
+        sleep "${CHECK_POLL_S:-60}"
+    done
+    st="$(btrfs scrub status "$mnt" 2>/dev/null || true)"
+    if grep -qE "Error summary:[[:space:]]+no errors found" <<<"$st"; then
+        say "btrfs $mnt : scrub terminé, aucune erreur."
+    else
+        say "⚠ btrfs $mnt : erreurs détectées :"; echo "$st" | sed -n '1,15p'; PROBLEMS=1
+    fi
+}
+
+raid_check() {
+    [[ "$CHECK_RAID" == "true" ]] || return 0
+    local src fstype
+    src="$(findmnt -no SOURCE -T "$BACKUP_ROOT" 2>/dev/null || true)"
+    fstype="$(findmnt -no FSTYPE -T "$BACKUP_ROOT" 2>/dev/null || true)"
+
+    case "$fstype" in
+        zfs)   scrub_zfs "${src%%/*}"; return ;;
+        btrfs) scrub_btrfs "$BACKUP_ROOT"; return ;;
+    esac
+    # mdadm : le périphérique est /dev/mdX, ou un volume LVM/chiffré posé dessus
+    local md=""
+    if [[ "$src" == /dev/md* ]]; then
+        md="$src"
+    elif [[ -n "$src" ]]; then
+        md="$(lsblk -nsro NAME,TYPE "$src" 2>/dev/null | awk '$2 ~ /^raid/ {print "/dev/" $1; exit}' || true)"
+    fi
+    if [[ -n "$md" ]]; then scrub_md "$md"; else say "RAID : pas de RAID mdadm/ZFS/btrfs détecté sous $BACKUP_ROOT, contrôle du volume ignoré (source : ${src:-inconnue})."; fi
+}
+
+# --- 2. Intégrité des sauvegardes ----------------------------------------------------------------
+data_check() {
+    [[ "$CHECK_DATA" == "true" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || { say "python3 absent : contrôle d'intégrité ignoré."; return 0; }
+    local n out rc res corrupt_file
+    for n in $(hb_source_names); do
+        [[ -d "$BACKUP_ROOT/$n/mirror" ]] || continue
+        if (( $(time_left) <= 0 )); then say "[$n] contrôle d'intégrité reporté (durée maximale atteinte)."; INCOMPLETE=1; continue; fi
+        corrupt_file="$HB_STATE/$n.corrupt"
+        # Nouveau cycle (parcours précédent terminé) : on repart d'une liste vide
+        [[ -f "$HB_STATE/$n.verify-pending" ]] || : > "$corrupt_file"
+        set +e
+        out="$(python3 "$VERIFY" "$BACKUP_ROOT/$n/mirror" "$HB_STATE/$n.manifest.sqlite" \
+                --deadline "$DEADLINE" --corrupt-list "$corrupt_file" 2>&1)"
+        rc=$?
+        set -e
+        res="$(grep '^RESULT ' <<<"$out" | tail -n1)"
+        if (( rc > 1 )) || [[ -z "$res" ]]; then
+            say "⚠ [$n] le contrôle d'intégrité a échoué : $(tail -n 3 <<<"$out" | tr '\n' ' ')"; PROBLEMS=1; continue
+        fi
+        if [[ "$res" == *"complete=0"* ]]; then
+            touch "$HB_STATE/$n.verify-pending"; INCOMPLETE=1
+            say "[$n] intégrité : parcours interrompu (durée maximale), reprise au prochain démarrage. ${res#RESULT }"
+        else
+            rm -f "$HB_STATE/$n.verify-pending"
+            say "[$n] intégrité : ${res#RESULT }"
+        fi
+        local total; total="$(wc -l < "$corrupt_file" 2>/dev/null || echo 0)"
+        if (( total > 0 )); then
+            say "⚠ [$n] $total fichier(s) corrompu(s) dans la sauvegarde (liste : $corrupt_file) :"
+            head -n 20 "$corrupt_file" | sed 's/^/     /'
+            say "     Réparation depuis le serveur source : homelab-backup-ctl repair $n"
+            PROBLEMS=1
+        fi
+    done
+}
+
+say "=== Contrôle mensuel ($(date '+%F %T')), durée maximale ${CHECK_MAX_H} h ==="
+hb_notify check "Contrôle d'intégrité démarré" "RAID puis intégrité des sauvegardes (durée maximale ${CHECK_MAX_H} h)."
+raid_check
+data_check
+# Un contrôle complet (même avec problèmes) est daté : les problèmes sont signalés une fois, pas chaque semaine.
+if (( INCOMPLETE == 0 )); then date +%s > "$HB_STATE/check.last"; fi
+say "Durée du contrôle : $(( ( $(date +%s) - START ) / 60 )) min."
+if (( PROBLEMS )); then hb_notify alert "Contrôle d'intégrité : PROBLÈMES" "$OUT"; exit 1; fi
+if (( INCOMPLETE )); then hb_notify check "Contrôle d'intégrité incomplet" "$OUT"; exit 2; fi
+hb_notify check "Contrôle d'intégrité : OK" "$OUT"
+exit 0

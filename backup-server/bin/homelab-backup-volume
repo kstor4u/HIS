@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# Détecte et monte le volume de sauvegarde existant (RAID logiciel, LVM, ZFS, disque déjà formaté),
+# comme le fait Ubuntu : sans JAMAIS rien formater. Demande quoi faire à chaque étape.
+#
+#   homelab-backup-volume          assistant interactif (aussi lancé par install.sh si le volume est absent)
+#   homelab-backup-ctl volume      idem
+#
+# Résultat : volume monté sur BACKUP_MOUNT (fstab par UUID, grappe mdadm déclarée pour le démarrage),
+# et BACKUP_MOUNT / BACKUP_ROOT mis à jour dans /etc/homelab-backup/backup.json.
+set -Eeuo pipefail
+
+HB_ETC="${HB_ETC:-/etc/homelab-backup}"
+CONF="$HB_ETC/backup.json"
+FSTAB="${FSTAB:-/etc/fstab}"
+MDCONF="${MDCONF:-/etc/mdadm/mdadm.conf}"
+HB_LIB="${HB_LIB:-/usr/local/lib/homelab-backup/lib.sh}"
+
+# shellcheck disable=SC1090
+source "$HB_LIB"
+hb_load_conf 2>/dev/null || true
+
+say()  { echo "$*"; }
+die()  { echo "ERREUR : $*" >&2; exit 1; }
+ask()  { local p="$1" a; read -r -p "$p" a || die "Pas de terminal : relance cette commande dans une session interactive."; echo "$a"; }
+
+[[ $EUID -eq 0 ]] || die "À lancer en root."
+
+set_conf() {   # set_conf CLE VALEUR : remplace (ou ajoute) la valeur dans backup.json
+    [[ -f "$CONF" ]] || die "$CONF introuvable : lance d'abord ./install.sh."
+    hb_conf_set "$1" "$2" || die "Impossible de modifier $CONF."
+}
+
+ensure_tools() {
+    local pkgs=()
+    command -v mdadm >/dev/null 2>&1 || pkgs+=(mdadm)
+    command -v vgchange >/dev/null 2>&1 || pkgs+=(lvm2)
+    command -v btrfs >/dev/null 2>&1 || pkgs+=(btrfs-progs)
+    if (( ${#pkgs[@]} )); then
+        say "Installation de : ${pkgs[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 || say "(installation partielle : certaines détections peuvent manquer)"
+    fi
+}
+
+# --- Détection ---------------------------------------------------------------------------
+assemble_md() {
+    command -v mdadm >/dev/null 2>&1 || return 0
+    local conf; conf="$(mktemp)"
+    mdadm --examine --scan > "$conf" 2>/dev/null || true
+    [[ -s "$conf" ]] || { rm -f "$conf"; return 0; }
+
+    mdadm --assemble --scan --config="$conf" --no-degraded >/dev/null 2>&1 || true
+    udevadm settle 2>/dev/null || true
+
+    # Grappes vues sur les disques mais non démarrées (disque manquant) ?
+    local missing=0 line uuid
+    while read -r line; do
+        uuid="$(grep -o 'UUID=[^ ]*' <<<"$line" | cut -d= -f2)"
+        [[ -n "$uuid" ]] || continue
+        mdadm --detail --scan 2>/dev/null | grep -qi "$uuid" || missing=1
+    done < "$conf"
+
+    if (( missing )); then
+        say
+        say "⚠ Une grappe RAID est présente sur les disques mais ne peut pas démarrer normalement (disque absent ou en panne)."
+        say "  Elle peut être démarrée en mode DÉGRADÉ (sans redondance) pour lire/sauvegarder les données."
+        if [[ "$(ask 'Démarrer la grappe en mode dégradé ? [o/N] : ')" =~ ^[oOyY]$ ]]; then
+            mdadm --assemble --scan --config="$conf" --run >/dev/null 2>&1 || say "Le démarrage dégradé a échoué (voir : mdadm --examine --scan ; cat /proc/mdstat)."
+            udevadm settle 2>/dev/null || true
+        fi
+    fi
+    rm -f "$conf"
+}
+
+activate_lvm() {
+    command -v vgchange >/dev/null 2>&1 && vgchange -ay >/dev/null 2>&1 || true
+    udevadm settle 2>/dev/null || true
+}
+
+# Lignes "périphérique|fstype|taille|label|montage|origine"
+list_fs() {
+    local line origin NAME FSTYPE SIZE LABEL MOUNTPOINT TYPE
+    while IFS= read -r line; do
+        NAME="" FSTYPE="" SIZE="" LABEL="" MOUNTPOINT="" TYPE=""
+        eval "$line"
+        case "$FSTYPE" in ext2 | ext3 | ext4 | xfs | btrfs | f2fs) ;; *) continue ;; esac
+        [[ "$NAME" == *--disk--* || "$NAME" == */pve-* || "$NAME" == /dev/pve/* ]] && continue
+        case "$MOUNTPOINT" in / | /boot | /boot/efi | "[SWAP]") continue ;; esac
+        case "$TYPE" in raid*) origin="RAID" ;; lvm) origin="LVM" ;; *) origin="disque" ;; esac
+        printf '%s|%s|%s|%s|%s|%s\n' "$NAME" "$FSTYPE" "$SIZE" "${LABEL:--}" "${MOUNTPOINT:--}" "$origin"
+    done < <(lsblk -prP -o NAME,FSTYPE,SIZE,LABEL,MOUNTPOINT,TYPE 2>/dev/null)
+}
+
+list_zfs_pools() {
+    command -v zpool >/dev/null 2>&1 || return 0
+    zpool import 2>/dev/null | awk '/^[[:space:]]*pool:/ {print $2}'
+}
+
+# --- Montage ---------------------------------------------------------------------------------
+persist_md() {
+    local dev="$1" md arr_uuid
+    command -v mdadm >/dev/null 2>&1 || return 0
+    md="$(lsblk -nsro NAME,TYPE "$dev" 2>/dev/null | awk '$2 ~ /^raid/ {print "/dev/" $1; exit}' || true)"
+    [[ "$dev" == /dev/md* ]] && md="$dev"
+    [[ -n "$md" ]] || return 0
+    mkdir -p "$(dirname "$MDCONF")"; touch "$MDCONF"
+    arr_uuid="$(mdadm --detail "$md" 2>/dev/null | awk '/UUID :/ {print $3}')"
+    if [[ -n "$arr_uuid" ]] && ! grep -qi "$arr_uuid" "$MDCONF"; then
+        mdadm --detail --scan "$md" >> "$MDCONF"
+        say "Grappe $md déclarée dans $MDCONF."
+        update-initramfs -u >/dev/null 2>&1 || say "⚠ update-initramfs a échoué : vérifie que la grappe se réassemble au démarrage."
+    fi
+}
+
+mount_fs() {
+    local dev="$1" fstype="$2" mnt="$3" uuid
+    uuid="$(blkid -s UUID -o value "$dev" 2>/dev/null || true)"
+    [[ -n "$uuid" ]] || die "UUID de $dev illisible."
+    mkdir -p "$mnt"
+
+    if grep -qE "[[:space:]]${mnt}[[:space:]]" "$FSTAB"; then
+        cp "$FSTAB" "${FSTAB}.bak-$(date +%Y%m%d%H%M%S)"
+        sed -i "\|[[:space:]]${mnt}[[:space:]]|d" "$FSTAB"
+    fi
+    printf 'UUID=%s %s %s defaults,noatime,nofail,x-systemd.device-timeout=30s 0 2\n' "$uuid" "$mnt" "$fstype" >> "$FSTAB"
+    systemctl daemon-reload 2>/dev/null || true
+    mountpoint -q "$mnt" || mount "$mnt"
+    mountpoint -q "$mnt" || die "$mnt n'est pas monté."
+}
+
+choose_subfolder() {   # $1 = point de montage ; positionne BACKUP_ROOT_NEW
+    local mnt="$1" count default ans
+    count="$(find "$mnt" -mindepth 1 -maxdepth 1 ! -name 'lost+found' 2>/dev/null | wc -l)"
+    say
+    if (( count > 0 )); then
+        say "Le volume contient déjà $count élément(s) à sa racine :"
+        ls -la "$mnt" | sed -n '2,14p'
+        default=2
+    else
+        say "Le volume est vide."
+        default=1
+    fi
+    say "  1) Sauvegarder à la racine du volume ($mnt)"
+    say "  2) Sauvegarder dans un sous-dossier dédié ($mnt/homelab-backup)  — recommandé si le volume contient déjà des fichiers"
+    ans="$(ask "Choix [$default] : ")"; ans="${ans:-$default}"
+    case "$ans" in
+        1) BACKUP_ROOT_NEW="$mnt" ;;
+        2) BACKUP_ROOT_NEW="$mnt/homelab-backup"; mkdir -p "$BACKUP_ROOT_NEW" ;;
+        *) die "Choix invalide." ;;
+    esac
+}
+
+main() {
+    ensure_tools
+    say "Recherche des grappes RAID, volumes LVM et pools ZFS..."
+    assemble_md
+    activate_lvm
+
+    local -a fs=() pools=()
+    local line
+    while IFS= read -r line; do [[ -n "$line" ]] && fs+=("$line"); done < <(list_fs)
+    while IFS= read -r line; do [[ -n "$line" ]] && pools+=("$line"); done < <(list_zfs_pools)
+
+    if (( ${#fs[@]} + ${#pools[@]} == 0 )); then
+        say
+        say "Aucun volume existant détecté (ni RAID mdadm, ni LVM, ni ZFS, ni disque formaté ext4/xfs/btrfs)."
+        say "Ce script ne crée ni ne formate jamais de volume. État des disques :"
+        lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT
+        say
+        say "Si une grappe est attendue : mdadm --examine --scan ; cat /proc/mdstat"
+        exit 1
+    fi
+
+    say
+    say "Volumes existants détectés (sans formatage) :"
+    local i=1 dev fstype size label mnt origin
+    for line in "${fs[@]}"; do
+        IFS='|' read -r dev fstype size label mnt origin <<< "$line"
+        printf '  %d) %-24s %-6s %-8s %-7s label=%s  monté: %s\n' "$i" "$dev" "$fstype" "$size" "$origin" "$label" "$mnt"
+        i=$(( i + 1 ))
+    done
+    local p
+    for p in "${pools[@]}"; do
+        printf '  %d) pool ZFS « %s » (à importer)\n' "$i" "$p"
+        i=$(( i + 1 ))
+    done
+    say "  q) Quitter sans rien changer"
+    local choice; choice="$(ask "Quel volume utiliser pour les sauvegardes ? [1-$(( i - 1 )) / q] : ")"
+    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )) || { say "Rien n'a été modifié."; exit 0; }
+
+    local mount_target BACKUP_ROOT_NEW
+
+    if (( choice <= ${#fs[@]} )); then
+        IFS='|' read -r dev fstype size label mnt origin <<< "${fs[choice-1]}"
+
+        # Aperçu en lecture seule
+        if [[ "$mnt" == "-" ]]; then
+            local prev; prev="$(mktemp -d)"
+            if mount -o ro "$dev" "$prev" 2>/dev/null; then
+                say; say "Aperçu de $dev :"; ls -la "$prev" | sed -n '2,14p'
+                df -h --output=size,used,avail "$prev" | tail -n1
+                umount "$prev"
+            fi
+            rmdir "$prev" 2>/dev/null || true
+        fi
+
+        local default_mnt="${BACKUP_MOUNT:-/mnt/backups}"
+        if [[ "$mnt" != "-" ]]; then
+            say "$dev est déjà monté sur $mnt : il sera utilisé là."
+            mount_target="$mnt"
+        else
+            mount_target="$(ask "Point de montage [$default_mnt] : ")"; mount_target="${mount_target:-$default_mnt}"
+            [[ "$mount_target" == /* ]] || die "Chemin absolu attendu."
+            [[ "$(ask "Monter $dev sur $mount_target (AUCUN formatage) ? [o/N] : ")" =~ ^[oOyY]$ ]] || { say "Rien n'a été modifié."; exit 0; }
+            persist_md "$dev"
+            mount_fs "$dev" "$fstype" "$mount_target"
+        fi
+    else
+        local pool="${pools[choice-${#fs[@]}-1]}"
+        [[ "$(ask "Importer le pool ZFS « $pool » (aucune modification des données) ? [o/N] : ")" =~ ^[oOyY]$ ]] || { say "Rien n'a été modifié."; exit 0; }
+        if ! zpool import "$pool" 2>/tmp/zimport.err; then
+            say "Import refusé : $(head -n2 /tmp/zimport.err | tr '\n' ' ')"
+            [[ "$(ask "Forcer l'import (pool utilisé par un autre système, ex. ancien serveur éteint) ? [o/N] : ")" =~ ^[oOyY]$ ]] || exit 1
+            zpool import -f "$pool" || die "Import impossible."
+        fi
+        mount_target="$(zfs get -H -o value mountpoint "$pool")"
+        [[ "$mount_target" == /* ]] || die "Le pool $pool n'a pas de point de montage utilisable (zfs get mountpoint $pool)."
+        zfs mount -a 2>/dev/null || true
+        mountpoint -q "$mount_target" || die "$mount_target n'est pas monté."
+    fi
+
+    choose_subfolder "$mount_target"
+
+    set_conf BACKUP_MOUNT "$mount_target"
+    set_conf BACKUP_ROOT "$BACKUP_ROOT_NEW"
+    chmod 700 "$BACKUP_ROOT_NEW" 2>/dev/null || true
+
+    say
+    say "Volume prêt : $BACKUP_ROOT_NEW (monté sur $mount_target)"
+    df -h "$mount_target" | tail -n1
+    say "Configuration mise à jour : BACKUP_MOUNT=$mount_target, BACKUP_ROOT=$BACKUP_ROOT_NEW"
+}
+
+main "$@"

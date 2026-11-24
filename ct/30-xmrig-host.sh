@@ -44,9 +44,9 @@ EOF
 #                              MSR (RandomX)                                  #
 ###############################################################################
 
-# Applique le réglage MSR recommandé par XMRig pour RandomX (désactive
-# les préfetchers matériels Intel via le registre 0x1a4, gain typique
-# 10-15% de hashrate). Fait sur l'HÔTE, pas dans le CT XMRig : les MSR
+# Applique le réglage MSR recommandé par XMRig pour RandomX : Intel
+# (préfetchers désactivés via 0x1a4) ou AMD Zen1 à Zen5 (registres
+# 0xc0011020-2b), détection automatique ; gain typique 5-15% de hashrate. Fait sur l'HÔTE, pas dans le CT XMRig : les MSR
 # sont un état du CPU physique partagé par tout l'hôte, pas quelque
 # chose qu'un conteneur (même privilégié) peut régler pour lui-même -
 # XMRig continuera d'afficher un avertissement MSR dans le CT, ignorable
@@ -73,12 +73,54 @@ configure_msr_optimization() {
 
 set -Eeuo pipefail
 
-VENDOR="$(awk -F': ' '/vendor_id/{print $2; exit}' /proc/cpuinfo)"
+# Réglages MSR RandomX recommandés par XMRig (scripts/randomx_boost.sh),
+# choisis selon le fabricant et la génération du CPU.
 
-if [[ "$VENDOR" != "GenuineIntel" ]]; then
-    echo "CPU non-Intel détecté (${VENDOR:-inconnu}) : réglage MSR 0x1a4 ignoré (spécifique Intel)." >&2
-    exit 0
-fi
+VENDOR="$(awk -F': *' '/^vendor_id/{print $2; exit}' /proc/cpuinfo)"
+FAMILY="$(awk -F': *' '/^cpu family/{print $2; exit}' /proc/cpuinfo)"
+MODEL="$(awk -F': *' '/^model[ \t]*:/{print $2; exit}' /proc/cpuinfo)"
+NAME="$(awk -F': *' '/^model name/{print $2; exit}' /proc/cpuinfo)"
+
+# Chaque entrée : "registre valeur"
+WRITES=()
+LABEL=""
+
+case "$VENDOR" in
+    GenuineIntel)
+        LABEL="Intel"
+        # Désactive les 4 préfetchers matériels.
+        WRITES=("0x1a4 0xf")
+        ;;
+    AuthenticAMD)
+        case "$FAMILY" in
+            23)
+                LABEL="AMD Zen1/Zen+/Zen2"
+                WRITES=("0xc0011020 0x0" "0xc0011021 0x40" "0xc0011022 0x1510000" "0xc001102b 0x2000cc16")
+                ;;
+            25)
+                if [[ "$MODEL" == "97" ]]; then
+                    LABEL="AMD Zen4"
+                    WRITES=("0xc0011020 0x4400000000000" "0xc0011021 0x4000000000040" "0xc0011022 0x8680000401570000" "0xc001102b 0x2040cc10")
+                else
+                    LABEL="AMD Zen3"
+                    WRITES=("0xc0011020 0x4480000000000" "0xc0011021 0x1c000200000040" "0xc0011022 0xc000000401500000" "0xc001102b 0x2000cc14")
+                fi
+                ;;
+            26)
+                LABEL="AMD Zen5"
+                WRITES=("0xc0011020 0x4400000000000" "0xc0011021 0x4000000000040" "0xc0011022 0x8680000401570000" "0xc001102b 0x2040cc10")
+                ;;
+            *)
+                echo "CPU AMD famille ${FAMILY} non gérée (${NAME:-inconnu}) : réglage MSR ignoré." >&2
+                exit 0
+                ;;
+        esac
+        ;;
+    *)
+        echo "CPU ${VENDOR:-inconnu} non géré : réglage MSR ignoré." >&2
+        exit 0
+        ;;
+esac
 
 MODULE_WAS_LOADED=false
 
@@ -88,9 +130,17 @@ fi
 
 modprobe msr
 
-# Registre 0x1a4 : désactive les 4 préfetchers matériels Intel
-# (documenté par Intel, recommandation officielle XMRig pour RandomX).
-wrmsr -a 0x1a4 0xf
+for entry in "${WRITES[@]}"; do
+    # shellcheck disable=SC2086
+    wrmsr -a ${entry}
+done
+
+# Relecture sur le cœur 0, pour le journal (journalctl -u xmrig-msr-tune).
+echo "MSR appliqués : ${LABEL} (${NAME:-?}, famille ${FAMILY}, modèle ${MODEL})"
+for entry in "${WRITES[@]}"; do
+    reg="${entry%% *}"
+    echo "  ${reg} = 0x$(rdmsr -p 0 "$reg") (attendu ${entry#* })"
+done
 
 if [[ "$MODULE_WAS_LOADED" != "true" ]]; then
     rmmod msr
@@ -123,6 +173,6 @@ EOF
     systemctl enable --now xmrig-msr-tune.service || true
 
     systemctl is-active --quiet xmrig-msr-tune.service \
-        || warn "xmrig-msr-tune inactif (CPU non-Intel, ou noyau restreignant l'accès aux MSR) : XMRig fonctionnera, juste avec un hashrate un peu plus faible."
+        || warn "xmrig-msr-tune inactif (CPU non géré, ou noyau restreignant l'accès aux MSR) : XMRig fonctionnera, juste avec un hashrate un peu plus faible."
 }
 

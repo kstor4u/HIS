@@ -2,14 +2,14 @@
 #                              SWAG                                           #
 ###############################################################################
 
-# Conf nginx SWAG du sous-domaine media -> Jellyfin (affichée sur stdout).
+# Conf nginx SWAG des sous-domaines JELLYFIN_SUBDOMAIN -> Jellyfin (affichée sur stdout).
 swag_media_conf() {
     cat <<CONF
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
 
-    server_name media.${DOMAIN};
+    server_name $(sd_fqdns JELLYFIN_SUBDOMAIN);
 
     include /config/nginx/ssl.conf;
 
@@ -22,6 +22,191 @@ server {
     }
 }
 CONF
+}
+
+# Conf nginx SWAG du sous-domaine NODE_SUBDOMAIN -> application Node (CT NODE).
+swag_node_conf() {
+    cat <<CONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    server_name $(sd_fqdns NODE_SUBDOMAIN);
+
+    include /config/nginx/ssl.conf;
+
+    client_max_body_size 100M;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        proxy_pass http://${NODE_IP%%/*}:${NODE_HTTP_PORT};
+    }
+}
+CONF
+}
+
+# Répare/valide les confs nginx de SWAG : le proxy.conf des versions récentes définit déjà
+# proxy_read_timeout / proxy_send_timeout ; les redéfinir dans une conf de site fait
+# refuser nginx ("directive is duplicate") et TOUS les sites tombent en timeout.
+# Usage : ./install.sh --run swag_nginx_fix
+swag_nginx_fix() {
+    info "SWAG : suppression des timeouts en double dans les confs de sites, test et rechargement de nginx..."
+    pct exec "$SWAG_ID" -- bash -c '
+        docker exec swag sh -c "sed -i -E \"/^[[:space:]]*proxy_(read|send)_timeout[[:space:]]/d\" /config/nginx/site-confs/*.conf" || true
+        docker exec swag nginx -t' \
+        || die "SWAG : nginx refuse encore la configuration (voir le message ci-dessus ; pct exec ${SWAG_ID} -- docker exec swag nginx -t)."
+    pct exec "$SWAG_ID" -- docker restart swag >/dev/null
+    info "SWAG : configuration nginx valide, conteneur redémarré."
+}
+
+# Conf nginx SWAG de ntfy (notifications) : connexions longues (SSE/WebSocket), sans mise en tampon.
+swag_ntfy_conf() {
+    cat <<CONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    server_name $(sd_fqdns NTFY_SUBDOMAIN);
+
+    include /config/nginx/ssl.conf;
+
+    client_max_body_size 20M;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        proxy_pass http://${MONITOR_IP%%/*}:${NTFY_PORT};
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+}
+CONF
+}
+
+# Confs nginx SWAG des serveurs de documents (Collabora / OnlyOffice).
+# Pas de "$" ici (heredoc non protégé) : les en-têtes WebSocket viennent de proxy.conf.
+swag_collabora_conf() {
+    cat <<CONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    server_name $(sd_fqdns COLLABORA_SUBDOMAIN);
+
+    include /config/nginx/ssl.conf;
+
+    client_max_body_size 100M;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        proxy_pass http://${DOCKER_IP%%/*}:${COLLABORA_HTTP_PORT};
+    }
+}
+CONF
+}
+
+swag_onlyoffice_conf() {
+    cat <<CONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    server_name $(sd_fqdns ONLYOFFICE_SUBDOMAIN);
+
+    include /config/nginx/ssl.conf;
+
+    client_max_body_size 100M;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        proxy_pass http://${DOCKER_IP%%/*}:${ONLYOFFICE_HTTP_PORT};
+    }
+}
+CONF
+}
+
+# Confs nginx des applications Docker (Nextcloud, Sync-in, Immich) : une conf par service, plusieurs noms possibles.
+swag_app_conf() {   # $1 = variable de sous-domaine, $2 = port, $3 = taille max du corps
+    cat <<CONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    server_name $(sd_fqdns "$1");
+
+    include /config/nginx/ssl.conf;
+
+    client_max_body_size $3;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        proxy_pass http://${DOCKER_IP%%/*}:$2;
+    }
+}
+CONF
+}
+
+# Texte shell qui écrit TOUTES les confs de SWAG selon les services actifs et les sous-domaines choisis.
+# Utilisé à l'installation et par repair_swag_subdomains. Les fichiers cloud/sync/photos/media gardent
+# leur nom (continuité des installations existantes) ; node, ntfy, collabora et onlyoffice portent leur nom principal.
+swag_conf_blocks() {
+
+    local out="" f
+
+    out+="cat > /opt/swag/config/nginx/site-confs/cloud.conf <<'CONF_EOF'
+$(swag_app_conf NEXTCLOUD_SUBDOMAIN "$NEXTCLOUD_HTTP_PORT" 0)
+CONF_EOF
+
+cat > /opt/swag/config/nginx/site-confs/sync.conf <<'CONF_EOF'
+$(swag_app_conf SYNCIN_SUBDOMAIN "$SYNCIN_HTTP_PORT" 0)
+CONF_EOF
+
+cat > /opt/swag/config/nginx/site-confs/photos.conf <<'CONF_EOF'
+$(swag_app_conf IMMICH_SUBDOMAIN "$IMMICH_HTTP_PORT" 50000M)
+CONF_EOF
+
+"
+
+    if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
+        out+="cat > /opt/swag/config/nginx/site-confs/media.conf <<'CONF_EOF'
+$(swag_media_conf)
+CONF_EOF
+"
+    fi
+
+    if [[ "$ENABLE_COLLABORA" == "true" ]]; then
+        out+="cat > /opt/swag/config/nginx/site-confs/${COLLABORA_SUBDOMAIN}.conf <<'CONF_EOF'
+$(swag_collabora_conf)
+CONF_EOF
+"
+    fi
+
+    if [[ "$ENABLE_ONLYOFFICE" == "true" ]]; then
+        out+="cat > /opt/swag/config/nginx/site-confs/${ONLYOFFICE_SUBDOMAIN}.conf <<'CONF_EOF'
+$(swag_onlyoffice_conf)
+CONF_EOF
+"
+    fi
+
+    if [[ "$ENABLE_NODE" == "true" && -n "$NODE_SUBDOMAIN" ]]; then
+        out+="cat > /opt/swag/config/nginx/site-confs/${NODE_SUBDOMAIN}.conf <<'CONF_EOF'
+$(swag_node_conf)
+CONF_EOF
+"
+    fi
+
+    if [[ "${ENABLE_MONITOR:-false}" == "true" && "$MONITOR_NTFY" == "true" && -n "$NTFY_SUBDOMAIN" ]]; then
+        out+="cat > /opt/swag/config/nginx/site-confs/${NTFY_SUBDOMAIN}.conf <<'CONF_EOF'
+$(swag_ntfy_conf)
+CONF_EOF
+"
+    fi
+
+    printf '%s' "$out"
 }
 
 # Vérifie que Let's Encrypt a bien émis le certificat. Si l'émission échoue,
@@ -59,7 +244,7 @@ verify_swag_certificate() {
         docker exec swag tail -n 60 /config/log/letsencrypt/letsencrypt.log 2>/dev/null | grep -iE 'detail|problem|too many|caa|retry after' | tail -n 8
     " || true
 
-    warn "À vérifier : enregistrements A (${DOMAIN}, cloud, sync, photos, photo), redirection TCP 80 ET 443 de la box vers ${LAN_IP}."
+    warn "À vérifier : enregistrements A (${DOMAIN}, $(subdomain_hosts_csv | sed 's/,/, /g')), redirection TCP 80 ET 443 de la box vers ${LAN_IP}."
     warn "Après correction : pct exec ${SWAG_ID} -- docker restart swag  (puis ./install.sh --run verify_swag_certificate)."
     warn "Rappel : Let's Encrypt limite à 5 échecs/heure et 5 certificats identiques/semaine (réinstallations répétées)."
 
@@ -87,7 +272,7 @@ create_swag_ct() {
         --cores "$SWAG_CORES" \
         --memory "$SWAG_MEMORY" \
         --swap 512 \
-        --rootfs "local-lvm:${SWAG_DISK%G}" \
+        --rootfs "${GUEST_STORAGE}:${SWAG_DISK%G}" \
         --net0 "name=eth0,bridge=${PRIVATE_BRIDGE},firewall=1,gw=${SWAG_GATEWAY},ip=${SWAG_IP}" \
         --unprivileged 1 \
         --features "nesting=1,keyctl=1" \
@@ -101,17 +286,10 @@ create_swag_ct() {
     local SCRIPT
     SCRIPT="$(mktemp)"
 
-    # Sous-domaines du certificat : media (Jellyfin) seulement s'il est activé.
-    local SWAG_SUBDOMAINS="cloud,sync,photos,photo"
-    local MEDIA_BLOCK=""
-
-    if [[ "$ENABLE_JELLYFIN" == "true" ]]; then
-        SWAG_SUBDOMAINS+=",media"
-        MEDIA_BLOCK="cat > /opt/swag/config/nginx/site-confs/media.conf <<'CONF_EOF'
-$(swag_media_conf)
-CONF_EOF
-"
-    fi
+    # Sous-domaines du certificat et confs nginx : voir core/35-subdomains.sh
+    local SWAG_SUBDOMAINS SWAG_CONF_BLOCKS
+    SWAG_SUBDOMAINS="$(subdomain_hosts_csv)"
+    SWAG_CONF_BLOCKS="$(swag_conf_blocks)"
 
     cat > "$SCRIPT" <<EOF
 #!/usr/bin/env bash
@@ -195,64 +373,8 @@ done
 [[ -d /opt/swag/config/nginx/site-confs ]] \
     || { echo "ERREUR: /opt/swag/config/nginx/site-confs absent, confs reverse-proxy non générées."; exit 1; }
 
-cat > /opt/swag/config/nginx/site-confs/cloud.conf <<'CONF_EOF'
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-
-    server_name cloud.${DOMAIN};
-
-    include /config/nginx/ssl.conf;
-
-    client_max_body_size 0;
-
-    location / {
-        include /config/nginx/proxy.conf;
-        include /config/nginx/resolver.conf;
-        proxy_pass http://${DOCKER_IP%%/*}:${NEXTCLOUD_HTTP_PORT};
-    }
-}
-CONF_EOF
-
-cat > /opt/swag/config/nginx/site-confs/sync.conf <<'CONF_EOF'
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-
-    server_name sync.${DOMAIN};
-
-    include /config/nginx/ssl.conf;
-
-    client_max_body_size 0;
-
-    location / {
-        include /config/nginx/proxy.conf;
-        include /config/nginx/resolver.conf;
-        proxy_pass http://${DOCKER_IP%%/*}:${SYNCIN_HTTP_PORT};
-    }
-}
-CONF_EOF
-
-cat > /opt/swag/config/nginx/site-confs/photos.conf <<'CONF_EOF'
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-
-    server_name photos.${DOMAIN} photo.${DOMAIN};
-
-    include /config/nginx/ssl.conf;
-
-    client_max_body_size 50000M;
-
-    location / {
-        include /config/nginx/proxy.conf;
-        include /config/nginx/resolver.conf;
-        proxy_pass http://${DOCKER_IP%%/*}:${IMMICH_HTTP_PORT};
-    }
-}
-CONF_EOF
-
-${MEDIA_BLOCK}docker compose restart swag
+${SWAG_CONF_BLOCKS}
+docker compose restart swag
 
 docker compose ps
 EOF

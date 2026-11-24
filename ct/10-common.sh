@@ -33,19 +33,19 @@ download_debian_lxc_template() {
     [[ -n "$template" ]] \
         || die "Impossible de trouver un template Debian 13 amd64."
 
-    if ! pveam list local |
+    if ! pveam list "$TEMPLATE_STORAGE" |
         awk '{print $1}' |
-        grep -qx "local:vztmpl/${template}"; then
+        grep -qx "${TEMPLATE_STORAGE}:vztmpl/${template}"; then
 
         info "Téléchargement du template ${template}..."
 
         # >&2 : la barre de progression de pveam va sur stderr, jamais
         # sur stdout (aucun appelant ne capture cette fonction via un
         # $(...) désormais, mais autant rester prudent).
-        pveam download local "$template" >&2
+        pveam download "$TEMPLATE_STORAGE" "$template" >&2
     fi
 
-    DOWNLOADED_TEMPLATE="local:vztmpl/${template}"
+    DOWNLOADED_TEMPLATE="${TEMPLATE_STORAGE}:vztmpl/${template}"
 }
 
 ###############################################################################

@@ -1,0 +1,47 @@
+# Schéma des variables de /etc/homelab-backup/backup.json (serveur de sauvegarde N54L).
+# Une ligne par variable : V^groupe^NOM^type^défaut^description   (type : str | int | bool ; jamais de « ^ » dans le texte)
+# Source unique : fichier neuf, fusion après mise à jour (homelab-backup-ctl update-conf) et « homelab-backup-ctl describe ».
+# Ajouter une variable : sa valeur par défaut dans lib/lib.sh (ou un ${NOM:-défaut} là où elle sert) + une ligne ici.
+V^volume^BACKUP_MOUNT^str^/mnt/backups^Point de montage du volume de sauvegarde (doit être monté, sinon la sauvegarde est refusée). Renseigné par homelab-backup-ctl volume, qui détecte un RAID existant sans le formater.
+V^volume^BACKUP_ROOT^str^/mnt/backups^Dossier des sauvegardes : la racine du volume ou un sous-dossier. Renseigné par homelab-backup-ctl volume.
+V^reveil^WAKE_DAY^str^Sunday^Jour du réveil hebdomadaire (nom anglais : Sunday, Monday...).
+V^reveil^WAKE_TIME^str^03:00^Heure du réveil (HH:MM).
+V^reveil^MAX_RUNTIME_H^int^8^Arrêt de la sauvegarde au bout de N heures.
+V^reveil^POWER_OFF^bool^true^S'éteindre après la sauvegarde et programmer le réveil suivant (alarme RTC).
+V^reveil^WAKE_TOLERANCE_MIN^int^180^Un démarrage à moins de N minutes du réveil prévu compte comme automatique (sinon : pas de sauvegarde ni d'extinction).
+V^changements^CHANGE_THRESHOLD^int^10^Pourcentage de fichiers transférés + supprimés (par rapport à la dernière référence valide) au-delà duquel l'instantané est mis à part (.SUSPECT) et une alerte part. Les sauvegardes suivantes restent suspectes tant que homelab-backup-ctl ack n'a pas été fait.
+V^conservation^KEEP_LAST^int^8^Derniers instantanés hebdomadaires conservés.
+V^conservation^KEEP_MONTHLY^int^12^Plus le plus ancien instantané de chacun des N derniers mois.
+V^controle^CHECK_MONTHLY^bool^true^Contrôle périodique du RAID et de l'intégrité des sauvegardes.
+V^controle^CHECK_INTERVAL_DAYS^int^28^Intervalle entre deux contrôles complets (le premier a lieu à la première sauvegarde).
+V^controle^CHECK_RAID^bool^true^Vérification du RAID mdadm, scrub ZFS ou btrfs.
+V^controle^CHECK_DATA^bool^true^Relecture de tous les fichiers et comparaison aux empreintes mémorisées (corruption silencieuse).
+V^controle^CHECK_MAX_H^int^20^Durée maximale d'un contrôle ; au-delà il est interrompu et reprend au réveil suivant (le serveur reste allumé plus longtemps ces jours-là).
+V^restauration^RESTORE_TEST^bool^true^Test de restauration à chaque sauvegarde réussie : échantillon de fichiers, dumps de bases de chaque site, archives vzdump.
+V^restauration^RESTORE_SAMPLE^int^40^Nombre de fichiers tirés au hasard (les fichiers témoins sont toujours inclus).
+V^restauration^RESTORE_TEST_STORAGE^str^^Ex. local-lvm : restaure vraiment le plus petit CT dans un CT temporaire non démarré, puis le supprime. Vide = pas de restauration réelle.
+V^restauration^RESTORE_TEST_ID^int^9990^Identifiant libre utilisé pour ce CT temporaire.
+V^admin_ssh^ADMIN_USER^str^^Compte sudo à créer pour ne plus travailler en root (ex. roland). Vide = pas de compte.
+V^admin_ssh^ADMIN_PASSWORD^str^^Mot de passe du compte ; vide = généré et affiché une fois.
+V^admin_ssh^ADMIN_SSH_KEY^str^^Clé publique SSH du compte (ssh-ed25519 ...).
+V^admin_ssh^SSH_ROOT_LOGIN^str^^no = connexion SSH directe de root interdite (exige ADMIN_USER avec clé ou mot de passe) | prohibit-password = clé seulement | vide = inchangé.
+V^reseau^NETWORK_MODE^str^^dhcp = pont réseau du N54L en DHCP (appliqué au prochain démarrage). Vide = inchangé.
+V^reseau^NETWORK_BRIDGE^str^vmbr0^Nom du pont réseau concerné par NETWORK_MODE.
+V^export^EXPORT_MARKER^str^HOMELAB-BACKUP^Fichier à créer à la racine d'un disque USB pour autoriser l'export des sauvegardes sur ce disque.
+V^export^EXPORT_KEEP^int^1^Exports conservés par source sur le disque externe.
+V^export^EXPORT_ALLOWED_UUIDS^str^^UUID de disques autorisés (séparés par des espaces). Vide = tout disque portant le marqueur.
+V^mail^MAIL_TO^str^^Adresse qui reçoit les comptes rendus et alertes. Vide = pas de mail (messages dans le journal). Prévoir un serveur SMTP indépendant de tes serveurs.
+V^mail^MAIL_FROM^str^^Expéditeur ; vide = MAIL_TO.
+V^mail^SMTP_HOST^str^^Serveur SMTP (ex. smtp.gmail.com) ; vide = pas de mail.
+V^mail^SMTP_PORT^int^587^Port SMTP.
+V^mail^SMTP_USER^str^^Identifiant SMTP.
+V^mail^SMTP_PASSWORD^str^^Mot de passe SMTP (mot de passe d'application recommandé).
+V^mail^SMTP_TLS^str^starttls^starttls | tls | off.
+V^mail^REPORT_ALWAYS^bool^true^false = mail seulement en cas d'alerte ou d'échec.
+V^mail^HEARTBEAT_URL^str^^Appelée après une sauvegarde réussie (ex. URL « push » d'Uptime Kuma : alerte si elle n'arrive pas).
+V^telegram^TELEGRAM_BOT_TOKEN^str^^Jeton du bot créé avec @BotFather ; vide = pas de Telegram.
+V^telegram^TELEGRAM_CHAT_ID^str^^Identifiant(s) de discussion, séparés par des virgules (homelab-backup-ctl telegram-id).
+V^telegram^TELEGRAM_EVENTS^str^usb backup check restore alert power security^Catégories envoyées : usb (disque branché, export) | power (allumage et arrêt) | backup (démarrage, début/fin de chaque source, rapport, extinction) | check (RAID + intégrité) | restore (test de restauration) | alert (échecs et alertes) | security (actions à distance) | all.
+V^telegram^TELEGRAM_ADMIN_ID^str^^Ton identifiant Telegram ; vide = aucune action à distance.
+V^telegram^TELEGRAM_ACTIONS^str^^Groupes d'actions à distance autorisés : backup (sauvegarde, intégrité, restauration, rester allumé) | power (éteindre, redémarrer). Vide = lecture seule. Utiliser un bot DIFFÉRENT de celui du serveur principal.
+V^telegram^TELEGRAM_ACTION_DELAY^int^60^Secondes avant extinction ou redémarrage demandé par Telegram (/annuler possible).

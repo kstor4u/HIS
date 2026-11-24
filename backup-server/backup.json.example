@@ -1,0 +1,69 @@
+{
+  "_version": "2.0.0",
+  "_note": "Réglages du serveur de sauvegarde. Les groupes sont organisationnels : seul le nom de la variable compte. homelab-backup-ctl describe NOM explique chaque variable.",
+  "volume": {
+    "BACKUP_MOUNT": "/mnt/backups",
+    "BACKUP_ROOT": "/mnt/backups"
+  },
+  "reveil": {
+    "WAKE_DAY": "Sunday",
+    "WAKE_TIME": "03:00",
+    "MAX_RUNTIME_H": 8,
+    "POWER_OFF": true,
+    "WAKE_TOLERANCE_MIN": 180
+  },
+  "changements": {
+    "CHANGE_THRESHOLD": 10
+  },
+  "conservation": {
+    "KEEP_LAST": 8,
+    "KEEP_MONTHLY": 12
+  },
+  "controle": {
+    "CHECK_MONTHLY": true,
+    "CHECK_INTERVAL_DAYS": 28,
+    "CHECK_RAID": true,
+    "CHECK_DATA": true,
+    "CHECK_MAX_H": 20
+  },
+  "restauration": {
+    "RESTORE_TEST": true,
+    "RESTORE_SAMPLE": 40,
+    "RESTORE_TEST_STORAGE": "",
+    "RESTORE_TEST_ID": 9990
+  },
+  "admin_ssh": {
+    "ADMIN_USER": "",
+    "ADMIN_PASSWORD": "",
+    "ADMIN_SSH_KEY": "",
+    "SSH_ROOT_LOGIN": ""
+  },
+  "reseau": {
+    "NETWORK_MODE": "",
+    "NETWORK_BRIDGE": "vmbr0"
+  },
+  "export": {
+    "EXPORT_MARKER": "HOMELAB-BACKUP",
+    "EXPORT_KEEP": 1,
+    "EXPORT_ALLOWED_UUIDS": ""
+  },
+  "mail": {
+    "MAIL_TO": "",
+    "MAIL_FROM": "",
+    "SMTP_HOST": "",
+    "SMTP_PORT": 587,
+    "SMTP_USER": "",
+    "SMTP_PASSWORD": "",
+    "SMTP_TLS": "starttls",
+    "REPORT_ALWAYS": true,
+    "HEARTBEAT_URL": ""
+  },
+  "telegram": {
+    "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_CHAT_ID": "",
+    "TELEGRAM_EVENTS": "usb backup check restore alert power security",
+    "TELEGRAM_ADMIN_ID": "",
+    "TELEGRAM_ACTIONS": "",
+    "TELEGRAM_ACTION_DELAY": 60
+  }
+}

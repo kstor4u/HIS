@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Bot Telegram du SERVEUR DE SAUVEGARDE. Tourne SANS privilège (utilisateur hb-bot) : il ne fait qu'analyser les
+# messages et appeler « sudo homelab-actions <verbe> <cible> <code> <id> », seul point d'entrée autorisé.
+set -u
+CONF="${BOT_CONF:-/etc/homelab-backup/telegram.conf}"
+# shellcheck disable=SC1090
+. "$CONF" || exit 1
+[[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || { echo "Telegram non configuré." >&2; exit 1; }
+
+ACTIONS_BIN="${ACTIONS_BIN:-sudo -n /usr/local/sbin/homelab-backup-actions}"
+OFFSET_FILE="${OFFSET_FILE:-/var/lib/homelab-backup-bot/telegram.offset}"
+API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+
+# Appel d'API : le jeton passe par stdin (-K -), jamais dans la liste des processus.
+tg() { local method="$1"; shift; printf 'url = "%s/%s"\n' "$API" "$method" | curl -sS --max-time "${TG_TIMEOUT:-20}" -K - "$@"; }
+send() { tg sendMessage --data-urlencode "chat_id=$1" --data-urlencode "text=$2" -o /dev/null || true; }
+# Efface le message contenant un code (sans effet si Telegram refuse : le code est de toute façon à usage unique)
+wipe() { tg deleteMessage -d "chat_id=$1" -d "message_id=$2" -o /dev/null 2>&1 || true; }
+
+authorized() { local c; for c in ${TELEGRAM_CHAT_ID//,/ }; do [[ "$c" == "$1" ]] && return 0; done; return 1; }
+group_enabled() { [[ " ${TELEGRAM_ACTIONS:-} " == *" $1 "* ]]; }
+
+act() {   # verbe cible code uid -> sortie texte
+    local out
+    out="$($ACTIONS_BIN "$1" "$2" "$3" "$4" 2>&1)" || true
+    printf '%s' "${out:-Pas de réponse.}"
+}
+
+cmd_help() {
+    cat <<'H'
+Lecture seule : /etat
+Actions (discussion privée, administrateur, code à 6 chiffres, groupes activés sur le serveur) :
+/sauvegarder CODE : lance une sauvegarde maintenant
+/integrite CODE : test d'intégrité des disques
+/testrestauration CODE
+/rester_allume CODE : ne pas s'éteindre après la sauvegarde
+/extinction_auto CODE : réactive l'extinction automatique
+/eteindre CODE : éteint (réveil automatique conservé)
+/redemarrer CODE
+/annuler : annule une extinction/redémarrage programmé
+H
+}
+
+handle_action() {
+    local chat="$1" ctype="$2" from="$3" mid="$4" cmd="$5" rest="$6" verb group t code="-"
+    case "$cmd" in
+        /sauvegarder)      verb=run;         group=backup ;;
+        /integrite)        verb=check;       group=backup ;;
+        /testrestauration) verb=restoretest; group=backup ;;
+        /rester_allume)    verb=keep-on;     group=backup ;;
+        /extinction_auto)  verb=keep-off;    group=backup ;;
+        /eteindre)         verb=poweroff;    group=power ;;
+        /redemarrer)       verb=reboot;      group=power ;;
+        *) return 1 ;;
+    esac
+    for t in $rest; do
+        if [[ "$t" =~ ^[0-9]{6}$ ]]; then code="$t"; else send "$chat" "Argument non reconnu."; return 0; fi
+    done
+    [[ "$code" != "-" ]] && wipe "$chat" "$mid"
+    if [[ "$ctype" != "private" || -z "${TELEGRAM_ADMIN_ID:-}" || "$from" != "$TELEGRAM_ADMIN_ID" || "$chat" != "$TELEGRAM_ADMIN_ID" ]]; then
+        logger -t homelab-backup-bot "Action ${verb} refusée : ${from} dans ${chat} (${ctype})"
+        send "$chat" "Les actions ne sont possibles que pour l'administrateur, en discussion privée."; return 0
+    fi
+    group_enabled "$group" || { send "$chat" "Action désactivée : « ${group} » n'est pas dans TELEGRAM_ACTIONS."; return 0; }
+    send "$chat" "$(act "$verb" - "$code" "$from")"
+}
+
+handle() {
+    local chat="$1" ctype="$2" from="$3" mid="$4" text="$5" cmd rest
+    cmd="${text%% *}"; cmd="${cmd%%@*}"; cmd="${cmd,,}"
+    rest=""; [[ "$text" == *" "* ]] && rest="${text#* }"
+    case "$cmd" in
+        /etat | /status)              send "$chat" "$(act status - - "$from")" ;;
+        /annuler | /cancel)
+            if [[ "$ctype" == "private" && -n "${TELEGRAM_ADMIN_ID:-}" && "$from" == "$TELEGRAM_ADMIN_ID" ]]; then send "$chat" "$(act cancel - - "$from")"
+            else send "$chat" "Réservé à l'administrateur, en discussion privée."; fi ;;
+        /start | /aide | /help)       send "$chat" "$(cmd_help)" ;;
+        /sauvegarder | /integrite | /testrestauration | /rester_allume | /extinction_auto | /eteindre | /redemarrer)
+            handle_action "$chat" "$ctype" "$from" "$mid" "$cmd" "$rest" ;;
+        /*)                           send "$chat" "Commande inconnue. /aide pour la liste." ;;
+        *)                            : ;;
+    esac
+}
+
+tg setMyCommands --data-urlencode 'commands=[{"command":"etat","description":"État du serveur de sauvegarde"},{"command":"aide","description":"Liste des commandes"}]' -o /dev/null 2>&1 || true
+
+offset="$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)"
+[[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+
+while true; do
+    resp="$(TG_TIMEOUT=65 tg getUpdates -d "offset=${offset}" -d timeout=50 --data-urlencode 'allowed_updates=["message"]' 2>/dev/null)" || resp=""
+    if ! jq -e '.ok == true' >/dev/null 2>&1 <<< "$resp"; then
+        [[ -n "${BOT_ONCE:-}" ]] && exit 1
+        sleep 15; continue
+    fi
+    while IFS=$'\t' read -r uid cid ctype from mid text; do
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        offset=$((uid + 1))
+        [[ "$from" =~ ^[0-9]+$ ]] || from=0
+        if authorized "$cid"; then
+            handle "$cid" "$ctype" "$from" "$mid" "$text"
+        else
+            logger -t homelab-telegram-bot "Message ignoré : discussion non autorisée ${cid}"
+        fi
+    done < <(jq -r '.result[] | [.update_id, (.message.chat.id // ""), (.message.chat.type // ""), (.message.from.id // ""), (.message.message_id // ""), ((.message.text // "") | gsub("[\\t\\n]"; " "))] | @tsv' <<< "$resp")
+    printf '%s' "$offset" > "$OFFSET_FILE"
+    [[ -n "${BOT_ONCE:-}" ]] && exit 0
+done
